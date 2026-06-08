@@ -37,7 +37,7 @@ class MazeActionRNN(nn.Module):
         )
         self.action_head = nn.Linear(hidden_dim, 4)
 
-    def forward(self, batch):
+    def forward(self, batch, return_hidden: bool = False):
         x = torch.cat(
             [
                 self.state_embedding(batch["state"]),
@@ -50,4 +50,9 @@ class MazeActionRNN(nn.Module):
         )
         output, _ = self.rnn(x)
         logits = self.action_head(output)
+        if return_hidden:
+            return {
+                "logits": logits,
+                "hidden": output,
+            }
         return logits

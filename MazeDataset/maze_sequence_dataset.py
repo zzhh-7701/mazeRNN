@@ -141,4 +141,6 @@ def collate_maze_sequences(batch):
         "target": targets,
         "lengths": lengths,
         "mask": mask,
+        "subid": torch.tensor([x["subid"] for x in batch], dtype=torch.long),
+        "trial": torch.tensor([x["trial"] for x in batch], dtype=torch.long),
     }
