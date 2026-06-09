@@ -83,7 +83,7 @@ class MazeSequenceDataset(Dataset):
     @staticmethod
     def _build_samples(df: pd.DataFrame):
         samples = []
-        for row in df.itertuples(index=False):
+        for sample_id, row in enumerate(df.itertuples(index=False)):
             action = parse_json_list(getattr(row, "action"))
             true_path = parse_json_list(getattr(row, "true_path"))
 
@@ -101,6 +101,7 @@ class MazeSequenceDataset(Dataset):
                     "task": torch.full((len(action),), int(row.task), dtype=torch.long),
                     "replan": torch.full((len(action),), int(row.replan), dtype=torch.long),
                     "target": torch.tensor(action, dtype=torch.long),
+                    "sample_id": sample_id,
                     "subid": int(row.subid),
                     "trial": int(row.trial),
                 }
@@ -141,6 +142,7 @@ def collate_maze_sequences(batch):
         "target": targets,
         "lengths": lengths,
         "mask": mask,
+        "sample_id": torch.tensor([x["sample_id"] for x in batch], dtype=torch.long),
         "subid": torch.tensor([x["subid"] for x in batch], dtype=torch.long),
         "trial": torch.tensor([x["trial"] for x in batch], dtype=torch.long),
     }

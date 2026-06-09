@@ -33,6 +33,7 @@ def collect_hidden_states(model, dataloader, device):
         "task": [],
         "replan": [],
         "target": [],
+        "sample_id": [],
         "subid": [],
         "trial": [],
         "step": [],
@@ -51,9 +52,11 @@ def collect_hidden_states(model, dataloader, device):
 
             batch_size, max_len = mask.shape
             step_index = torch.arange(max_len, device=device).expand(batch_size, max_len)
+            sample_id = batch["sample_id"].unsqueeze(1).expand(batch_size, max_len)
             subid = batch["subid"].unsqueeze(1).expand(batch_size, max_len)
             trial = batch["trial"].unsqueeze(1).expand(batch_size, max_len)
             chunks["step"].append(step_index[mask].detach().cpu().numpy())
+            chunks["sample_id"].append(sample_id[mask].detach().cpu().numpy())
             chunks["subid"].append(subid[mask].detach().cpu().numpy())
             chunks["trial"].append(trial[mask].detach().cpu().numpy())
 
@@ -125,6 +128,7 @@ def write_outputs(arrays, output_dir, n_pcs, max_decode_samples, seed):
             for key in [
                 "subid",
                 "trial",
+                "sample_id",
                 "step",
                 "state",
                 "goal",
