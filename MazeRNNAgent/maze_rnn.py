@@ -56,3 +56,58 @@ class MazeActionRNN(nn.Module):
                 "hidden": output,
             }
         return logits
+
+
+class MinimalMazeActionRNN(nn.Module):
+    """Predict actions from the strict minimal within-subject feature set."""
+
+    def __init__(
+        self,
+        n_states: int = 49,
+        n_actions_with_special: int = 6,
+        state_dim: int = 16,
+        action_dim: int = 8,
+        hidden_dim: int = 512,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.state_embedding = nn.Embedding(n_states, state_dim)
+        self.goal_embedding = nn.Embedding(n_states, state_dim)
+        self.prev_action_embedding = nn.Embedding(n_actions_with_special, action_dim)
+
+        continuous_dim = 7  # prev_reward, 4 maze-wall flags, trial_start, wall_hit
+        input_dim = state_dim * 2 + action_dim + continuous_dim
+        self.rnn = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.action_head = nn.Linear(hidden_dim, 4)
+
+    def build_input(self, batch):
+        return torch.cat(
+            [
+                self.state_embedding(batch["state"]),
+                self.goal_embedding(batch["goal"]),
+                self.prev_action_embedding(batch["prev_action"]),
+                batch["prev_reward"].unsqueeze(-1).float(),
+                batch["maze_wall"].float(),
+                batch["trial_start"].unsqueeze(-1).float(),
+                batch["prev_hit"].unsqueeze(-1).float(),
+            ],
+            dim=-1,
+        )
+
+    def forward(self, batch, return_hidden: bool = False):
+        x = self.build_input(batch)
+        output, _ = self.rnn(x)
+        logits = self.action_head(output)
+        if return_hidden:
+            return {
+                "logits": logits,
+                "hidden": output,
+            }
+        return logits

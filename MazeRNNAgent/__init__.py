@@ -1,2 +1,1 @@
-from .maze_rnn import MazeActionRNN
-
+from .maze_rnn import MazeActionRNN, MinimalMazeActionRNN

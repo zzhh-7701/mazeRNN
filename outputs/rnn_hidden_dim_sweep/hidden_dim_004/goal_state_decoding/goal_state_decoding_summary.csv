@@ -1,0 +1,3 @@
+﻿label,n_samples,n_train,n_test,n_classes,accuracy,balanced_accuracy,chance
+goal,50000,37500,12500,49,0.07944,0.04422990264640697,0.0411
+state,50000,37500,12500,49,0.1024,0.06894254769788352,0.04458

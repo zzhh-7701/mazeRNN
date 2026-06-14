@@ -16,6 +16,8 @@ Main outputs:
 - dynamics_pca_summary.csv: PCA explained variance.
 - pca_scatter_task_replan.png: sampled hidden states in PC1/PC2.
 - mean_pca_trajectory_task_replan.png: mean trajectories in PC1/PC2.
+- mean_pca_trajectory_pc1_pc2_pc3.png: mean trajectories in PC1/PC2/PC3.
+- sample_pca_trajectories_pc1_pc2_pc3.png: sampled single-sequence trajectories in PC1/PC2/PC3.
 - delta_norm_by_progress_task_replan.png: hidden update magnitude over trial progress.
 
 N transitions: 170468

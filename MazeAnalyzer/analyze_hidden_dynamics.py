@@ -195,6 +195,86 @@ def plot_mean_trajectories(trajectory_summary, output_dir):
     plt.close()
 
 
+def plot_mean_trajectories_3d(trajectory_summary, output_dir):
+    if trajectory_summary.empty or "mean_PC3" not in trajectory_summary:
+        return
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    for (task, replan), group in trajectory_summary.groupby(["task", "replan"]):
+        group = group.sort_values("progress_bin")
+        ax.plot(
+            group["mean_PC1"],
+            group["mean_PC2"],
+            group["mean_PC3"],
+            marker="o",
+            linewidth=1.5,
+            label=f"T{task} R{replan}",
+        )
+    ax.set_xlabel("Mean PC1")
+    ax.set_ylabel("Mean PC2")
+    ax.set_zlabel("Mean PC3")
+    ax.set_title("Mean hidden trajectory in PC1-PC2-PC3")
+    ax.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+    plt.savefig(output_dir / "mean_pca_trajectory_pc1_pc2_pc3.png", dpi=200)
+    plt.close()
+
+
+def plot_sample_trajectories_3d(step_table, output_dir, max_trajectories, seed):
+    if "PC3" not in step_table:
+        return
+
+    sample_ids = step_table["sample_id"].drop_duplicates().to_numpy()
+    if len(sample_ids) == 0:
+        return
+    rng = np.random.default_rng(seed)
+    if len(sample_ids) > max_trajectories:
+        sample_ids = rng.choice(sample_ids, size=max_trajectories, replace=False)
+
+    plot_data = step_table[step_table["sample_id"].isin(sample_ids)].copy()
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    for sample_id, group in plot_data.groupby("sample_id"):
+        group = group.sort_values("step")
+        task = group["task"].iloc[0]
+        replan = group["replan"].iloc[0]
+        ax.plot(
+            group["PC1"],
+            group["PC2"],
+            group["PC3"],
+            linewidth=0.8,
+            alpha=0.25,
+            color=f"C{int(task) % 10}",
+        )
+        ax.scatter(
+            group["PC1"].iloc[0],
+            group["PC2"].iloc[0],
+            group["PC3"].iloc[0],
+            s=10,
+            color=f"C{int(task) % 10}",
+            alpha=0.45,
+        )
+        if replan == 1:
+            ax.scatter(
+                group["PC1"].iloc[-1],
+                group["PC2"].iloc[-1],
+                group["PC3"].iloc[-1],
+                s=12,
+                marker="x",
+                color=f"C{int(task) % 10}",
+                alpha=0.7,
+            )
+
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_zlabel("PC3")
+    ax.set_title("Sample hidden trajectories in PC1-PC2-PC3")
+    plt.tight_layout()
+    plt.savefig(output_dir / "sample_pca_trajectories_pc1_pc2_pc3.png", dpi=200)
+    plt.close()
+
+
 def plot_delta_norm(transition_table, output_dir):
     if transition_table.empty:
         return
@@ -236,6 +316,8 @@ Main outputs:
 - dynamics_pca_summary.csv: PCA explained variance.
 - pca_scatter_task_replan.png: sampled hidden states in PC1/PC2.
 - mean_pca_trajectory_task_replan.png: mean trajectories in PC1/PC2.
+- mean_pca_trajectory_pc1_pc2_pc3.png: mean trajectories in PC1/PC2/PC3.
+- sample_pca_trajectories_pc1_pc2_pc3.png: sampled single-sequence trajectories in PC1/PC2/PC3.
 - delta_norm_by_progress_task_replan.png: hidden update magnitude over trial progress.
 
 N transitions: {len(transition_table)}
@@ -257,6 +339,7 @@ def build_arg_parser():
     )
     parser.add_argument("--n-pcs", type=int, default=3)
     parser.add_argument("--max-plot-points", type=int, default=8000)
+    parser.add_argument("--max-3d-trajectories", type=int, default=120)
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -283,6 +366,8 @@ def main() -> None:
 
     plot_pca_scatter(step_table, output_dir, args.max_plot_points, args.seed)
     plot_mean_trajectories(trajectory_summary, output_dir)
+    plot_mean_trajectories_3d(trajectory_summary, output_dir)
+    plot_sample_trajectories_3d(step_table, output_dir, args.max_3d_trajectories, args.seed)
     plot_delta_norm(transition_table, output_dir)
     write_readme(output_dir, hidden_path, pca_summary, transition_table)
 

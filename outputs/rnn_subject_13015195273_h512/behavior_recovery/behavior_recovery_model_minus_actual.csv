@@ -1,0 +1,5 @@
+﻿task,mean_path_length_model_minus_actual,mean_hit_rate_model_minus_actual,optimal_path_rate_model_minus_actual,clean_optimal_rate_model_minus_actual,reached_goal_rate_model_minus_actual,mean_path_efficiency_model_minus_actual
+1,2.416667,0.079676,-0.083333,-0.083333,-0.083333,-0.030909
+2,9.923077,0.16425,-0.153846,-0.153846,-0.076923,-0.233763
+3,20.833334,0.386432,-0.333333,-0.333333,-0.5,-0.323125
+4,18.22,0.054334,0.06,0.06,-0.34,-0.086508

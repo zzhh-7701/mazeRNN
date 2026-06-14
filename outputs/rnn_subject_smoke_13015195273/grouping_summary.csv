@@ -1,0 +1,3 @@
+﻿split,subject_id,n_sequences,n_steps,first_trial_index,last_trial_index,val_every,val_offset
+train,13015195273,10,253,0,38,4,3
+val,13015195273,10,100,3,39,4,3
