@@ -1,0 +1,17 @@
+﻿source,action,n_action,action_frac,n_hit,hit_frac_of_action
+new_scheduled_recovery,left,67,0.20303,3,0.044776
+new_scheduled_recovery,up,75,0.227273,32,0.426667
+new_scheduled_recovery,right,101,0.306061,50,0.49505
+new_scheduled_recovery,down,87,0.263636,35,0.402299
+old_minimal,left,58,0.210909,19,0.327586
+old_minimal,up,85,0.309091,48,0.564706
+old_minimal,right,86,0.312727,57,0.662791
+old_minimal,down,46,0.167273,8,0.173913
+context,left,61,0.237354,14,0.229508
+context,up,61,0.237354,20,0.327869
+context,right,84,0.326848,44,0.52381
+context,down,51,0.198444,12,0.235294
+actual,left,40,0.294118,1,0.025
+actual,up,32,0.235294,3,0.09375
+actual,right,31,0.227941,0,0.0
+actual,down,33,0.242647,1,0.030303

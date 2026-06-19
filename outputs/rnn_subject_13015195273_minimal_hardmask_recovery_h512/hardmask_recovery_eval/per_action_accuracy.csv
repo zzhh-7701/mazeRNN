@@ -1,0 +1,5 @@
+﻿true_action,n_steps,accuracy,mean_true_prob
+left,310,0.641935,0.629948
+up,359,0.626741,0.611423
+right,340,0.635294,0.609731
+down,304,0.648026,0.614849

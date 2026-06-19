@@ -236,6 +236,131 @@ class SubjectSequenceDataset(Dataset):
         return self.samples[index]
 
 
+class FullSubjectSequenceDataset(Dataset):
+    """One full chronological subject sequence with interspersed train/val masks."""
+
+    def __init__(
+        self,
+        csv_path: str | Path,
+        maze_wall_path: str | Path,
+        subject_id: int,
+        val_every: int = 4,
+        val_offset: int = 3,
+        valid_only: bool = False,
+        diagnostics_path: str | Path | None = None,
+        max_trials: int | None = None,
+    ) -> None:
+        self.csv_path = Path(csv_path)
+        self.maze_wall_path = Path(maze_wall_path)
+        self.subject_id = int(subject_id)
+        self.val_every = val_every
+        self.val_offset = val_offset
+
+        df = pd.read_csv(self.csv_path)
+        if valid_only:
+            if diagnostics_path is None:
+                raise ValueError("diagnostics_path is required when valid_only=True")
+            df = SubjectSequenceDataset._filter_valid_trials(df, Path(diagnostics_path))
+
+        df = df[df["subid"].eq(self.subject_id)].copy()
+        if df.empty:
+            raise ValueError(f"No rows found for subject_id={self.subject_id}")
+
+        df = df.sort_values(["day", "block", "trial", "replan", "createdat"], na_position="last")
+        df = df.reset_index(drop=True)
+        if max_trials is not None:
+            df = df.head(max_trials)
+
+        df["sequence_trial_index"] = np.arange(len(df))
+        df["is_validation_trial"] = np.arange(len(df)) % val_every == val_offset
+        self.trial_table = df.copy()
+        self.base_walls = _load_base_walls(self.maze_wall_path)
+        self.sample = self._build_full_sample(df)
+
+    def _build_full_sample(self, df: pd.DataFrame):
+        states = []
+        goals = []
+        prev_actions = []
+        tasks = []
+        replans = []
+        trial_starts = []
+        prev_hits = []
+        prev_rewards = []
+        wall_features = []
+        targets = []
+        trial_indices = []
+        step_indices = []
+        val_masks = []
+
+        for row in df.itertuples(index=False):
+            action = parse_json_list(getattr(row, "action"))
+            true_path = parse_json_list(getattr(row, "true_path"))
+            hits = parse_json_list(getattr(row, "hits"))
+            if len(action) == 0 or len(true_path) < len(action):
+                continue
+
+            row_states = true_path[: len(action)]
+            row_prev_actions = [START_ACTION] + action[:-1]
+            row_prev_hits = [0] + [int(bool(hit)) for hit in hits[:-1]]
+            row_prev_rewards = [0.0]
+            for step_idx in range(1, len(action)):
+                previous_hit = bool(hits[step_idx - 1]) if step_idx - 1 < len(hits) else False
+                previous_next_state = true_path[step_idx]
+                if previous_hit:
+                    row_prev_rewards.append(-1.0)
+                elif previous_next_state == int(row.goal):
+                    row_prev_rewards.append(1.0)
+                else:
+                    row_prev_rewards.append(0.0)
+
+            walls = _row_walls(row, self.base_walls)
+            for step_idx, state in enumerate(row_states):
+                states.append(int(state))
+                goals.append(_safe_int(row.goal))
+                prev_actions.append(int(row_prev_actions[step_idx]))
+                tasks.append(_safe_int(row.task))
+                replans.append(_safe_int(row.replan))
+                trial_starts.append(1 if step_idx == 0 else 0)
+                prev_hits.append(int(row_prev_hits[step_idx]))
+                prev_rewards.append(float(row_prev_rewards[step_idx]))
+                wall_features.append(_wall_features(walls, int(state)))
+                targets.append(int(action[step_idx]))
+                trial_indices.append(int(row.sequence_trial_index))
+                step_indices.append(step_idx)
+                val_masks.append(bool(row.is_validation_trial))
+
+        val_mask = torch.tensor(val_masks, dtype=torch.bool)
+        train_mask = ~val_mask
+        return {
+            "state": torch.tensor(states, dtype=torch.long),
+            "goal": torch.tensor(goals, dtype=torch.long),
+            "prev_action": torch.tensor(prev_actions, dtype=torch.long),
+            "task": torch.tensor(tasks, dtype=torch.long),
+            "replan": torch.tensor(replans, dtype=torch.long),
+            "trial_start": torch.tensor(trial_starts, dtype=torch.float32),
+            "prev_hit": torch.tensor(prev_hits, dtype=torch.float32),
+            "prev_reward": torch.tensor(prev_rewards, dtype=torch.float32),
+            "maze_wall": torch.tensor(wall_features, dtype=torch.float32),
+            "target": torch.tensor(targets, dtype=torch.long),
+            "trial_index": torch.tensor(trial_indices, dtype=torch.long),
+            "step_index": torch.tensor(step_indices, dtype=torch.long),
+            "mask": torch.ones(len(targets), dtype=torch.bool),
+            "train_mask": train_mask,
+            "val_mask": val_mask,
+            "subid": self.subject_id,
+            "first_trial_index": int(trial_indices[0]),
+            "last_trial_index": int(trial_indices[-1]),
+        }
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, index):
+        if index != 0:
+            raise IndexError(index)
+        return self.sample
+
+
 def collate_subject_sequences(batch):
     states = pad_sequence([x["state"] for x in batch], batch_first=True, padding_value=0)
     goals = pad_sequence([x["goal"] for x in batch], batch_first=True, padding_value=0)

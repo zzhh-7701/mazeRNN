@@ -1,0 +1,9 @@
+﻿source,task,n_trials,mean_path_length,mean_hit_rate,optimal_path_rate,clean_optimal_rate,reached_goal_rate,mean_path_efficiency
+actual_subject,1,12,9.583333,0.037831,0.5,0.5,1.0,0.851455
+actual_subject,2,13,12.846154,0.047738,0.230769,0.230769,1.0,0.725987
+actual_subject,3,12,11.333333,0.028381,0.333333,0.333333,1.0,0.714811
+actual_subject,4,50,17.9,0.312998,0.0,0.0,1.0,0.504644
+model_rollout,1,12,8.75,0.027877,0.583333,0.583333,1.0,0.910218
+model_rollout,2,13,24.0,0.213162,0.0,0.0,0.923077,0.506334
+model_rollout,3,12,17.5,0.13871,0.166667,0.166667,1.0,0.567191
+model_rollout,4,50,22.88,0.217267,0.04,0.04,0.9,0.511138

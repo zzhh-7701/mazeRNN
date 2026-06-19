@@ -1,0 +1,2 @@
+﻿epoch,train_loss,train_behavior_loss,train_illegal_loss,train_accuracy,train_steps,rollout_constraint_loss,rollout_constraint_steps,rollout_constraint_hit_rate,rollout_constraint_revisit_rate,val_loss,val_behavior_loss,val_illegal_loss,val_accuracy,val_steps,rollout_score,reached_goal_rate,mean_excess_steps,mean_hit_rate,mean_revisit_rate,mean_efficiency,selection_metric,selection_value
+1,1.432795,1.423801,0.299797,0.257426,202,0.177574,48,0.770833,0.104167,1.41394,1.40421,0.32431,0.192771,83,-1.164583,0.0,22.625,0.908333,0.0125,0.245833,rollout_score,-1.164583

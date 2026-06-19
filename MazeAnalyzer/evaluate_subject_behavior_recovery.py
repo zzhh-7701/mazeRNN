@@ -294,13 +294,15 @@ def model_rollout_trial(
     walls: list[set[int]],
     device,
     max_rollout_steps: int,
+    initial_hidden=None,
+    hard_illegal_mask: bool = False,
 ) -> tuple[list[int], list[bool], list[int]]:
     state = int(row.start)
     goal = int(row.goal)
     prev_action = START_ACTION
     prev_reward = 0.0
     prev_hit = 0.0
-    hidden = None
+    hidden = initial_hidden
     actions = []
     hits = []
     path = [state]
@@ -336,6 +338,15 @@ def model_rollout_trial(
             )
         output, hidden = model.rnn(x, hidden)
         logits = model.action_head(output)
+        if hard_illegal_mask:
+            illegal = [
+                action
+                for action in range(4)
+                if apply_action(state, action, walls)[1]
+            ]
+            if illegal:
+                logits = logits.clone()
+                logits[..., illegal] = -1e9
         action = int(logits.argmax(dim=-1).item())
 
         state, hit = apply_action(state, action, walls)
@@ -364,6 +375,7 @@ def simulate_predicted_trials(
     base_walls: dict[int, list[set[int]]],
     rollout_max_multiplier: int = 3,
     rollout_min_max_steps: int = 50,
+    hard_illegal_mask: bool = False,
 ) -> pd.DataFrame:
     rows = []
     with torch.no_grad():
@@ -381,6 +393,7 @@ def simulate_predicted_trials(
                 walls,
                 device,
                 max_rollout_steps=max_rollout_steps,
+                hard_illegal_mask=hard_illegal_mask,
             )
 
             row_dict = row._asdict()
@@ -471,6 +484,11 @@ def summarize_behavior(metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
     )
 
     pivot = summary.pivot(index="task", columns="source")
+    model_source = (
+        "model_context_rollout"
+        if "model_context_rollout" in summary["source"].unique()
+        else "model_rollout"
+    )
     diff_rows = []
     for task in sorted(task_metrics["task"].dropna().unique()):
         row = {"task": int(task)}
@@ -484,7 +502,7 @@ def summarize_behavior(metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
         ]:
             try:
                 row[f"{metric}_model_minus_actual"] = (
-                    pivot.loc[task, (metric, "model_rollout")]
+                    pivot.loc[task, (metric, model_source)]
                     - pivot.loc[task, (metric, "actual_subject")]
                 )
             except KeyError:
@@ -516,6 +534,11 @@ def build_arg_parser():
     parser.add_argument("--val-every", type=int, default=None)
     parser.add_argument("--val-offset", type=int, default=None)
     parser.add_argument("--max-trials", type=int, default=None)
+    parser.add_argument(
+        "--hard-illegal-mask",
+        action="store_true",
+        help="Mask illegal wall actions during free rollout.",
+    )
     return parser
 
 
@@ -531,6 +554,11 @@ def main() -> None:
     val_offset = args.val_offset if args.val_offset is not None else int(train_args.get("val_offset", 3))
     valid_only = args.valid_only or bool(train_args.get("valid_only", False))
     max_trials = args.max_trials if args.max_trials is not None else train_args.get("max_trials")
+    hard_illegal_mask = bool(
+        args.hard_illegal_mask
+        or train_args.get("hard_illegal_action_mask", False)
+        or train_args.get("training_recipe") == "minimal_rollout_constrained"
+    )
 
     args.subject_id = subject_id
     args.val_every = val_every
@@ -577,7 +605,13 @@ def main() -> None:
     baselines = compute_baseline_accuracy(eval_steps, eval_rows, train_dataset, base_walls)
     confusion_counts, confusion_normalized, per_action = compute_confusion_outputs(eval_steps)
 
-    behavior_trials = simulate_predicted_trials(eval_rows, model, device, base_walls)
+    behavior_trials = simulate_predicted_trials(
+        eval_rows,
+        model,
+        device,
+        base_walls,
+        hard_illegal_mask=hard_illegal_mask,
+    )
     teacher_forced_behavior_trials = simulate_teacher_forced_predicted_trials(
         eval_rows,
         eval_steps,
@@ -602,7 +636,7 @@ def main() -> None:
     )
 
     print(f"Subject: {subject_id}")
-    print(f"Split: {args.split}, valid_only={valid_only}")
+    print(f"Split: {args.split}, valid_only={valid_only}, hard_illegal_mask={hard_illegal_mask}")
     print(f"Evaluation steps: {len(eval_steps)}")
     print("\nAction baseline accuracy:")
     print(baselines.to_string(index=False))

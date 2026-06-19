@@ -1,0 +1,13 @@
+﻿model,task,n_steps,true_matches_shortest,pred_matches_shortest,pred_matches_true
+new_scheduled_recovery,1,115,0.730435,0.669565,0.756522
+new_scheduled_recovery,2,167,0.640719,0.550898,0.718563
+new_scheduled_recovery,3,136,0.713235,0.625,0.742647
+new_scheduled_recovery,4,895,0.468156,0.557542,0.612291
+old_minimal,1,115,0.730435,0.678261,0.765217
+old_minimal,2,167,0.640719,0.508982,0.712575
+old_minimal,3,136,0.713235,0.610294,0.75
+old_minimal,4,895,0.468156,0.531844,0.623464
+context,1,115,0.730435,0.565217,0.721739
+context,2,167,0.640719,0.556886,0.742515
+context,3,136,0.713235,0.588235,0.720588
+context,4,895,0.468156,0.52067,0.605587

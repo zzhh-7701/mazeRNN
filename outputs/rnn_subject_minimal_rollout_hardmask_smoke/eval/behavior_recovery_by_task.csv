@@ -1,0 +1,3 @@
+﻿source,task,n_trials,mean_path_length,mean_hit_rate,optimal_path_rate,clean_optimal_rate,reached_goal_rate,mean_path_efficiency
+actual_subject,1,8,10.375,0.056746,0.25,0.25,1.0,0.777183
+model_rollout,1,8,44.875,0.0,0.0,0.0,0.125,0.181667

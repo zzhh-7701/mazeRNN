@@ -1,0 +1,2 @@
+﻿subject_id,n_sequences,n_trials,n_steps,train_steps,val_steps,first_trial_index,last_trial_index,val_every,val_offset
+13015195273,1,351,5642,4329,1313,0,350,4,3
