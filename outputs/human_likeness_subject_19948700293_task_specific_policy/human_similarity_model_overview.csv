@@ -1,0 +1,2 @@
+﻿model,human_distance,human_similarity,length_w1_norm,excess_w1_norm,action_tv,turn_tv,revisit_abs,progress_abs,reached_gap
+task_specific_policy,1.985565,0.378888,0.380298,1.206585,0.024584,0.049782,0.054957,0.064926,0.044286

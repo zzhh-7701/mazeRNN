@@ -1,0 +1,9 @@
+﻿source,task,collision_rate,repeat_collision_rate,known_wall_collision_rate,unknown_wall_collision_rate
+actual_subject,1,0.037831,0.0,0.011111,0.02672
+actual_subject,2,0.047738,0.002564,0.005641,0.042097
+actual_subject,3,0.028381,0.0,0.005952,0.022428
+actual_subject,4,0.312998,0.02163,0.091912,0.221086
+model_rollout,1,0.046974,0.0,0.005208,0.041766
+model_rollout,2,0.192106,0.004808,0.01543,0.176676
+model_rollout,3,0.214388,0.008952,0.066696,0.147692
+model_rollout,4,0.151963,0.008735,0.035343,0.11662

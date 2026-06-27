@@ -1,0 +1,8 @@
+﻿method,accuracy,n_steps,note
+model_argmax,0.3,20,trained RNN argmax
+uniform_random_expected,0.25,20,expected accuracy for four equally likely actions
+legal_random_expected,0.420833,20,expected accuracy if guessing uniformly among legal moves
+train_majority_action,0.3,20,always predicts left from train split
+eval_majority_action_oracle,0.35,20,cheating baseline: always predicts eval majority up
+repeat_previous_action,0.3,20,uses previous action; first step falls back to train majority
+shortest_path_next_step_oracle,0.923077,13,uses stored shortest path at the current true state

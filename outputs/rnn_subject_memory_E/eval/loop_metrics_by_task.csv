@@ -1,0 +1,9 @@
+﻿source,task,node_revisit_rate,edge_revisit_rate,recent_loop_rate,backtrack_rate
+actual_subject,1,0.060913,0.005556,0.077976,0.036508
+actual_subject,2,0.082249,0.020513,0.101264,0.057954
+actual_subject,3,0.078645,0.00463,0.091815,0.064757
+actual_subject,4,0.061995,0.033877,0.340166,0.04694
+model_rollout,1,0.037153,0.005556,0.059821,0.037153
+model_rollout,2,0.048019,0.014841,0.219063,0.029513
+model_rollout,3,0.095684,0.028189,0.258077,0.057258
+model_rollout,4,0.121639,0.028125,0.213399,0.075659

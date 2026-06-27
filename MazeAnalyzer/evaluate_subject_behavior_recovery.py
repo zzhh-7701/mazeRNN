@@ -11,6 +11,15 @@ import torch
 from torch.utils.data import DataLoader
 
 from MazeDataset import SubjectSequenceDataset, collate_subject_sequences
+from MazeDataset.memory_state import (
+    ACTION_DELTAS,
+    ACTION_ENCODING,
+    DEFAULT_HEADING,
+    MazeMemoryState,
+    WALL_COLUMN_ORDER,
+    compute_relative_action,
+    update_heading,
+)
 from MazeDataset.maze_sequence_dataset import START_ACTION, parse_json_list
 from MazeDataset.subject_sequence_dataset import interspersed_trial_split
 from MazeRNNAgent import MazeActionRNN, MinimalMazeActionRNN
@@ -24,13 +33,7 @@ ACTION_NAMES = {
     2: "right",
     3: "down",
 }
-ACTION_DELTAS = {
-    0: -7,
-    1: -1,
-    2: 7,
-    3: 1,
-}
-WALL_COLUMNS = ["walls_l", "walls_u", "walls_r", "walls_d"]
+WALL_COLUMNS = list(WALL_COLUMN_ORDER)
 CORE_DIAGNOSTIC_COLUMNS = [
     "true_path_end_ok",
     "hit_consistent",
@@ -55,6 +58,14 @@ def parse_trial_walls(row, base_walls: dict[int, list[set[int]]]) -> list[set[in
     return base_walls[int(row.maze)]
 
 
+def parse_maybe_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return parse_json_list(value)
+
+
 def legal_actions(walls: list[set[int]], state: int) -> list[int]:
     return [action for action, blocked in enumerate(walls) if state not in blocked]
 
@@ -72,6 +83,103 @@ def apply_action(state: int, action: int, walls: list[set[int]]) -> tuple[int, b
 def wall_feature_tensor(walls: list[set[int]], state: int, device):
     values = [1.0 if state in direction_walls else 0.0 for direction_walls in walls]
     return torch.tensor([[values]], dtype=torch.float32, device=device)
+
+
+def memory_feature_tensor(
+    memory: MazeMemoryState,
+    state: int,
+    goal: int,
+    heading: int,
+    walls: list[set[int]],
+    variant: str,
+    step_idx: int,
+    device,
+):
+    return torch.tensor(
+        memory.get_features(
+            current_pos=state,
+            goal_pos=goal,
+            heading=heading,
+            walls=walls,
+            variant=variant,
+            t=step_idx,
+        ).reshape(1, 1, -1),
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def human_biased_logits(
+    logits: torch.Tensor,
+    memory: MazeMemoryState,
+    state: int,
+    goal: int,
+    heading: int,
+    args,
+) -> torch.Tensor:
+    if not getattr(args, "use_human_bias", False):
+        return logits
+    adjusted = logits.clone()
+    current_goal_distance = abs((int(goal) // 7) - (int(state) // 7)) + abs(
+        (int(goal) % 7) - (int(state) % 7)
+    )
+    for action in range(4):
+        known_wall = float(memory.known_wall_mask[int(state), action])
+        known_edge = float(memory.known_edge_mask[int(state), action])
+        unknown_edge = max(0.0, 1.0 - min(1.0, known_wall + known_edge))
+        adjusted[action] -= float(args.known_wall_penalty) * known_wall
+        adjusted[action] -= float(args.revisit_penalty) * float(
+            memory.visited_edge_count[int(state), action]
+        )
+        adjusted[action] += float(args.unexplored_bonus) * unknown_edge
+        if heading >= 0 and action == (int(heading) + 2) % 4:
+            adjusted[action] -= float(args.backtrack_penalty)
+
+        candidate = int(state) + ACTION_DELTAS[action]
+        if 0 <= candidate < 49:
+            next_goal_distance = abs((int(goal) // 7) - (candidate // 7)) + abs(
+                (int(goal) % 7) - (candidate % 7)
+            )
+            if next_goal_distance < current_goal_distance:
+                adjusted[action] += float(args.goal_progress_bonus)
+            if candidate in memory.recent_positions:
+                adjusted[action] -= float(args.loop_penalty)
+    return adjusted
+
+
+def memory_soft_logits(
+    logits: torch.Tensor,
+    memory: MazeMemoryState,
+    state: int,
+    goal: int,
+    heading: int,
+    args,
+) -> torch.Tensor:
+    adjusted = logits.clone()
+    current_goal_distance = abs((int(goal) // 7) - (int(state) // 7)) + abs(
+        (int(goal) % 7) - (int(state) % 7)
+    )
+    for action in range(4):
+        known_wall = float(memory.known_wall_mask[int(state), action])
+        known_edge = float(memory.known_edge_mask[int(state), action])
+        unknown_edge = max(0.0, 1.0 - min(1.0, known_wall + known_edge))
+        adjusted[action] -= float(args.known_wall_penalty) * known_wall
+        adjusted[action] -= float(args.revisit_penalty) * float(
+            memory.visited_edge_count[int(state), action]
+        )
+        adjusted[action] += float(args.unexplored_bonus) * unknown_edge
+        if heading >= 0 and action == (int(heading) + 2) % 4:
+            adjusted[action] -= float(args.backtrack_penalty)
+        candidate = int(state) + ACTION_DELTAS[action]
+        if 0 <= candidate < 49:
+            next_goal_distance = abs((int(goal) // 7) - (candidate // 7)) + abs(
+                (int(goal) % 7) - (candidate % 7)
+            )
+            if next_goal_distance < current_goal_distance:
+                adjusted[action] += float(args.goal_progress_bonus)
+            if candidate in memory.recent_positions:
+                adjusted[action] -= float(args.loop_penalty)
+    return adjusted
 
 
 def state_transition_to_action(current_state: int, next_state: int):
@@ -124,7 +232,13 @@ def load_model(checkpoint_path: Path, device):
     train_args = checkpoint.get("args", {})
     model_kind = checkpoint.get("model_kind", train_args.get("model_kind", "standard"))
     if model_kind == "minimal":
-        model = MinimalMazeActionRNN(hidden_dim=train_args.get("hidden_dim", 512)).to(device)
+        model = MinimalMazeActionRNN(
+            hidden_dim=train_args.get("hidden_dim", 512),
+            cognitive_feature_dim=train_args.get("cognitive_feature_dim", 0),
+            include_maze_wall=train_args.get("include_maze_wall", True),
+            use_relative_action_head=train_args.get("use_relative_action_head", False),
+            use_auxiliary_heads=train_args.get("use_auxiliary_heads", False),
+        ).to(device)
     else:
         model = MazeActionRNN(hidden_dim=train_args.get("hidden_dim", 64)).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -296,6 +410,9 @@ def model_rollout_trial(
     max_rollout_steps: int,
     initial_hidden=None,
     hard_illegal_mask: bool = False,
+    rollout_mask_policy: str = "none",
+    model_variant: str = "A",
+    args=None,
 ) -> tuple[list[int], list[bool], list[int]]:
     state = int(row.start)
     goal = int(row.goal)
@@ -306,6 +423,10 @@ def model_rollout_trial(
     actions = []
     hits = []
     path = [state]
+    hit_counts = Counter()
+    memory = MazeMemoryState()
+    memory.reset(task_id=int(row.task), trial_id=int(row.sequence_trial_index))
+    heading = DEFAULT_HEADING
 
     for step_idx in range(max_rollout_steps):
         batch = {
@@ -314,6 +435,16 @@ def model_rollout_trial(
             "prev_action": torch.tensor([[prev_action]], dtype=torch.long, device=device),
             "prev_reward": torch.tensor([[prev_reward]], dtype=torch.float32, device=device),
             "maze_wall": wall_feature_tensor(walls, state, device),
+            "cognitive_features": memory_feature_tensor(
+                memory,
+                state,
+                goal,
+                heading,
+                walls,
+                model_variant,
+                step_idx,
+                device,
+            ),
             "trial_start": torch.tensor(
                 [[1.0 if step_idx == 0 else 0.0]],
                 dtype=torch.float32,
@@ -338,7 +469,18 @@ def model_rollout_trial(
             )
         output, hidden = model.rnn(x, hidden)
         logits = model.action_head(output)
-        if hard_illegal_mask:
+        logits_1d = logits.squeeze(0).squeeze(0)
+        if args is not None and rollout_mask_policy != "memory_soft":
+            logits_1d = human_biased_logits(logits_1d, memory, state, goal, heading, args)
+            logits = logits_1d.reshape(1, 1, -1)
+        policy = rollout_mask_policy
+        if hard_illegal_mask and policy == "none":
+            policy = "hard"
+        if policy == "task_specific":
+            policy = "hard" if int(row.task) in {2, 3} else "repeated_hit"
+        if policy == "memory_soft":
+            logits = memory_soft_logits(logits_1d, memory, state, goal, heading, args).reshape(1, 1, -1)
+        elif policy == "hard":
             illegal = [
                 action
                 for action in range(4)
@@ -347,12 +489,28 @@ def model_rollout_trial(
             if illegal:
                 logits = logits.clone()
                 logits[..., illegal] = -1e9
+        elif policy == "repeated_hit":
+            illegal = [
+                action
+                for action in range(4)
+                if apply_action(state, action, walls)[1]
+                and hit_counts[(state, action)] > 0
+            ]
+            if illegal:
+                logits = logits.clone()
+                logits[..., illegal] = -1e9
         action = int(logits.argmax(dim=-1).item())
 
+        previous_state = state
         state, hit = apply_action(state, action, walls)
+        if hit:
+            hit_counts[(previous_state, action)] += 1
         actions.append(action)
         hits.append(bool(hit))
         path.append(state)
+        memory.update(previous_state, action, state, hit, t=step_idx)
+        memory.observe_local_walls(previous_state, walls)
+        heading = update_heading(heading, action, hit)
         prev_action = action
         prev_hit = 1.0 if hit else 0.0
         if hit:
@@ -376,6 +534,9 @@ def simulate_predicted_trials(
     rollout_max_multiplier: int = 3,
     rollout_min_max_steps: int = 50,
     hard_illegal_mask: bool = False,
+    rollout_mask_policy: str = "none",
+    model_variant: str = "A",
+    args=None,
 ) -> pd.DataFrame:
     rows = []
     with torch.no_grad():
@@ -394,6 +555,9 @@ def simulate_predicted_trials(
                 device,
                 max_rollout_steps=max_rollout_steps,
                 hard_illegal_mask=hard_illegal_mask,
+                rollout_mask_policy=rollout_mask_policy,
+                model_variant=model_variant,
+                args=args,
             )
 
             row_dict = row._asdict()
@@ -512,6 +676,242 @@ def summarize_behavior(metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
     return summary, pd.DataFrame(diff_rows).round(6)
 
 
+def manhattan_distance(a: int, b: int) -> int:
+    return abs((int(a) // 7) - (int(b) // 7)) + abs((int(a) % 7) - (int(b) % 7))
+
+
+def summarize_metric_group(
+    trial_features: pd.DataFrame,
+    columns: list[str],
+) -> pd.DataFrame:
+    if trial_features.empty:
+        return pd.DataFrame(columns=["source", "task", *columns])
+    return (
+        trial_features.groupby(["source", "task"], dropna=False)[columns]
+        .mean()
+        .reset_index()
+        .round(6)
+    )
+
+
+def compute_memory_strategy_outputs(
+    behavior_trials: pd.DataFrame,
+    base_walls: dict[int, list[set[int]]],
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    trial_rows = []
+    step_rows = []
+
+    for row in behavior_trials.itertuples(index=False):
+        actions = [int(x) for x in parse_maybe_list(row.action)]
+        hits = [bool(x) for x in parse_maybe_list(row.hits)]
+        path = [int(x) for x in parse_maybe_list(row.true_path)]
+        if not actions:
+            continue
+        walls = parse_trial_walls(row, base_walls)
+        memory = MazeMemoryState()
+        trial_index = int(getattr(row, "sequence_trial_index", getattr(row, "trial", -1)))
+        task = int(row.task)
+        memory.reset(task_id=task, trial_id=trial_index)
+        heading = DEFAULT_HEADING
+        collision_edges = Counter()
+
+        counters = Counter()
+        distance_deltas = []
+        last_state = int(row.start)
+        for step_idx, action in enumerate(actions):
+            state = path[step_idx] if step_idx < len(path) else last_state
+            local_features = memory.get_features(
+                current_pos=state,
+                goal_pos=int(row.goal),
+                heading=heading,
+                walls=walls,
+                variant="D",
+                t=step_idx,
+            )
+            known_wall = float(memory.known_wall_mask[state, action])
+            known_edge = float(memory.known_edge_mask[state, action])
+            unknown_edge = max(0.0, 1.0 - min(1.0, known_wall + known_edge))
+            next_state = (
+                path[step_idx + 1]
+                if step_idx + 1 < len(path)
+                else apply_action(state, action, walls)[0]
+            )
+            hit = hits[step_idx] if step_idx < len(hits) else next_state == state
+            relative_action = (
+                np.nan
+                if heading == DEFAULT_HEADING
+                else compute_relative_action(heading, action)
+            )
+            was_known_node = float(memory.known_node_mask[next_state])
+            would_loop = float(next_state in memory.recent_positions)
+
+            counters["collision"] += int(hit)
+            counters["known_wall_collision"] += int(hit and known_wall > 0)
+            counters["unknown_wall_collision"] += int(hit and unknown_edge > 0)
+            counters["unknown_edge_try"] += int(unknown_edge > 0)
+            counters["frontier_action"] += int(unknown_edge > 0)
+            counters["new_node_discovery"] += int((not hit) and was_known_node == 0)
+            counters["node_revisit"] += int((not hit) and memory.known_node_mask[next_state] > 0)
+            counters["edge_revisit"] += int(memory.visited_edge_count[state, action] > 0)
+            counters["recent_loop"] += int(would_loop)
+            counters["backtrack"] += int(relative_action == 3)
+            counters["forward"] += int(relative_action == 0)
+            counters["left_turn"] += int(relative_action == 1)
+            counters["right_turn"] += int(relative_action == 2)
+            counters["backward"] += int(relative_action == 3)
+            counters["wall_following"] += int(
+                heading != DEFAULT_HEADING
+                and (
+                    memory.known_wall_mask[state, (heading - 1) % 4] > 0
+                    or memory.known_wall_mask[state, (heading + 1) % 4] > 0
+                )
+            )
+            counters["right_hand_rule_match"] += int(
+                heading != DEFAULT_HEADING
+                and (
+                    (
+                        memory.known_wall_mask[state, (heading + 1) % 4] == 0
+                        and relative_action == 2
+                    )
+                    or (
+                        memory.known_wall_mask[state, (heading + 1) % 4] > 0
+                        and memory.known_wall_mask[state, heading] == 0
+                        and relative_action == 0
+                    )
+                )
+            )
+            counters["left_hand_rule_match"] += int(
+                heading != DEFAULT_HEADING
+                and (
+                    (
+                        memory.known_wall_mask[state, (heading - 1) % 4] == 0
+                        and relative_action == 1
+                    )
+                    or (
+                        memory.known_wall_mask[state, (heading - 1) % 4] > 0
+                        and memory.known_wall_mask[state, heading] == 0
+                        and relative_action == 0
+                    )
+                )
+            )
+            distance_deltas.append(
+                manhattan_distance(state, int(row.goal))
+                - manhattan_distance(next_state, int(row.goal))
+            )
+            if hit:
+                collision_edges[(state, action)] += 1
+
+            step_rows.append(
+                {
+                    "source": row.source,
+                    "task": task,
+                    "trial": int(row.trial) if not pd.isna(row.trial) else trial_index,
+                    "sequence_trial_index": trial_index,
+                    "step_index": step_idx,
+                    "state": state,
+                    "goal": int(row.goal),
+                    "action": action,
+                    "relative_action": relative_action,
+                    "heading": heading,
+                    "collision": int(hit),
+                    "known_wall_before": known_wall,
+                    "known_edge_before": known_edge,
+                    "unknown_edge_before": unknown_edge,
+                    "visited_node_count_before": float(memory.visited_node_count[state]),
+                    "visited_edge_count_before": float(memory.visited_edge_count[state, action]),
+                    "recent_loop_before": would_loop,
+                    "backtrack": int(relative_action == 3),
+                    "local_feature_dim": len(local_features),
+                }
+            )
+            memory.update(state, action, next_state, hit, t=step_idx)
+            memory.observe_local_walls(state, walls)
+            heading = update_heading(heading, action, hit)
+            last_state = next_state
+
+        n_steps = max(len(actions), 1)
+        shortest_steps = max(len(parse_maybe_list(row.short_path)) - 1, 1)
+        repeat_collisions = sum(max(0, count - 1) for count in collision_edges.values())
+        trial_rows.append(
+            {
+                "source": row.source,
+                "task": task,
+                "trial": int(row.trial) if not pd.isna(row.trial) else trial_index,
+                "sequence_trial_index": trial_index,
+                "n_steps": n_steps,
+                "collision_rate": counters["collision"] / n_steps,
+                "repeat_collision_rate": repeat_collisions / n_steps,
+                "known_wall_collision_rate": counters["known_wall_collision"] / n_steps,
+                "unknown_wall_collision_rate": counters["unknown_wall_collision"] / n_steps,
+                "node_revisit_rate": counters["node_revisit"] / n_steps,
+                "edge_revisit_rate": counters["edge_revisit"] / n_steps,
+                "recent_loop_rate": counters["recent_loop"] / n_steps,
+                "backtrack_rate": counters["backtrack"] / n_steps,
+                "unknown_edge_try_rate": counters["unknown_edge_try"] / n_steps,
+                "new_node_discovery_rate": counters["new_node_discovery"] / n_steps,
+                "frontier_action_rate": counters["frontier_action"] / n_steps,
+                "forward_rate": counters["forward"] / n_steps,
+                "left_turn_rate": counters["left_turn"] / n_steps,
+                "right_turn_rate": counters["right_turn"] / n_steps,
+                "backward_rate": counters["backward"] / n_steps,
+                "right_hand_rule_match": counters["right_hand_rule_match"] / n_steps,
+                "left_hand_rule_match": counters["left_hand_rule_match"] / n_steps,
+                "wall_following_rate": counters["wall_following"] / n_steps,
+                "distance_to_goal_delta_mean": float(np.mean(distance_deltas)),
+                "shortest_path_deviation": n_steps - shortest_steps,
+                "path_efficiency": shortest_steps / n_steps,
+            }
+        )
+
+    trial_features = pd.DataFrame(trial_rows).round(6)
+    outputs = {
+        "trial_memory_features": pd.DataFrame(step_rows).round(6),
+        "collision_metrics_by_task": summarize_metric_group(
+            trial_features,
+            [
+                "collision_rate",
+                "repeat_collision_rate",
+                "known_wall_collision_rate",
+                "unknown_wall_collision_rate",
+            ],
+        ),
+        "loop_metrics_by_task": summarize_metric_group(
+            trial_features,
+            [
+                "node_revisit_rate",
+                "edge_revisit_rate",
+                "recent_loop_rate",
+                "backtrack_rate",
+            ],
+        ),
+        "strategy_metrics_by_task": summarize_metric_group(
+            trial_features,
+            [
+                "forward_rate",
+                "left_turn_rate",
+                "right_turn_rate",
+                "backward_rate",
+                "right_hand_rule_match",
+                "left_hand_rule_match",
+                "wall_following_rate",
+            ],
+        ),
+        "memory_metrics_by_task": summarize_metric_group(
+            trial_features,
+            [
+                "unknown_edge_try_rate",
+                "new_node_discovery_rate",
+                "frontier_action_rate",
+                "distance_to_goal_delta_mean",
+                "shortest_path_deviation",
+                "path_efficiency",
+            ],
+        ),
+    }
+    outputs["trial_strategy_features"] = trial_features
+    return trial_features, outputs
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Evaluate single-subject action baselines, confusion matrix, and behavior recovery."
@@ -539,6 +939,19 @@ def build_arg_parser():
         action="store_true",
         help="Mask illegal wall actions during free rollout.",
     )
+    parser.add_argument(
+        "--rollout-mask-policy",
+        default=None,
+        choices=["none", "hard", "repeated_hit", "task_specific", "memory_soft"],
+    )
+    parser.add_argument("--model-variant", default=None, choices=["A", "B", "C", "D", "E"])
+    parser.add_argument("--use-human-bias", action="store_true")
+    parser.add_argument("--known-wall-penalty", type=float, default=None)
+    parser.add_argument("--revisit-penalty", type=float, default=None)
+    parser.add_argument("--loop-penalty", type=float, default=None)
+    parser.add_argument("--unexplored-bonus", type=float, default=None)
+    parser.add_argument("--goal-progress-bonus", type=float, default=None)
+    parser.add_argument("--backtrack-penalty", type=float, default=None)
     return parser
 
 
@@ -559,12 +972,30 @@ def main() -> None:
         or train_args.get("hard_illegal_action_mask", False)
         or train_args.get("training_recipe") == "minimal_rollout_constrained"
     )
+    rollout_mask_policy = args.rollout_mask_policy
+    if rollout_mask_policy is None:
+        rollout_mask_policy = train_args.get("rollout_mask_policy", "none")
+        if rollout_mask_policy == "none" and hard_illegal_mask:
+            rollout_mask_policy = "hard"
+    model_variant = args.model_variant or train_args.get("model_variant", "A")
+    for name, default in [
+        ("known_wall_penalty", 3.0),
+        ("revisit_penalty", 0.15),
+        ("loop_penalty", 0.5),
+        ("unexplored_bonus", 0.25),
+        ("goal_progress_bonus", 0.15),
+        ("backtrack_penalty", 0.1),
+    ]:
+        if getattr(args, name) is None:
+            setattr(args, name, train_args.get(name, default))
+    args.use_human_bias = bool(args.use_human_bias or train_args.get("use_human_bias", False))
 
     args.subject_id = subject_id
     args.val_every = val_every
     args.val_offset = val_offset
     args.valid_only = valid_only
     args.max_trials = max_trials
+    args.model_variant = model_variant
 
     output_dir = Path(args.output_dir) if args.output_dir else checkpoint_path.parent / "behavior_recovery"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -579,6 +1010,7 @@ def main() -> None:
         valid_only=valid_only,
         diagnostics_path=args.diagnostics,
         max_trials=max_trials,
+        model_variant=model_variant,
     )
     dataloader = DataLoader(
         dataset,
@@ -596,6 +1028,7 @@ def main() -> None:
         valid_only=valid_only,
         diagnostics_path=args.diagnostics,
         max_trials=max_trials,
+        model_variant=model_variant,
     )
 
     eval_rows = prepare_subject_rows(args)
@@ -611,6 +1044,9 @@ def main() -> None:
         device,
         base_walls,
         hard_illegal_mask=hard_illegal_mask,
+        rollout_mask_policy=rollout_mask_policy,
+        model_variant=model_variant,
+        args=args,
     )
     teacher_forced_behavior_trials = simulate_teacher_forced_predicted_trials(
         eval_rows,
@@ -620,12 +1056,60 @@ def main() -> None:
     behavior_metrics = add_trial_metrics(behavior_trials)
     teacher_forced_behavior_metrics = add_trial_metrics(teacher_forced_behavior_trials)
     behavior_summary, behavior_diff = summarize_behavior(behavior_metrics)
+    _, memory_outputs = compute_memory_strategy_outputs(behavior_trials, base_walls)
+    variant_summary = pd.DataFrame(
+        [
+            {
+                "checkpoint": str(checkpoint_path),
+                "model_kind": train_args.get("model_kind", "standard"),
+                "model_variant": model_variant,
+                "cognitive_feature_dim": int(train_args.get("cognitive_feature_dim", 0)),
+                "cognitive_feature_names": json.dumps(
+                    train_args.get("cognitive_feature_names", []),
+                    ensure_ascii=False,
+                ),
+                "include_maze_wall": bool(train_args.get("include_maze_wall", True)),
+                "use_relative_action_head": bool(
+                    train_args.get("use_relative_action_head", False)
+                ),
+                "use_auxiliary_heads": bool(train_args.get("use_auxiliary_heads", False)),
+                "action_encoding": json.dumps(
+                    train_args.get("action_encoding", ACTION_ENCODING),
+                    ensure_ascii=False,
+                ),
+                "action_deltas": json.dumps(
+                    train_args.get("action_deltas", ACTION_DELTAS),
+                    ensure_ascii=False,
+                ),
+                "wall_column_order": json.dumps(
+                    train_args.get("wall_column_order", WALL_COLUMNS),
+                    ensure_ascii=False,
+                ),
+                "heading_first_step_ignored": bool(
+                    train_args.get("heading_first_step_ignored", False)
+                ),
+                "hard_mask_used": bool(train_args.get("hard_mask_used", False)),
+                "shortest_recovery_oracle_used": bool(
+                    train_args.get("shortest_recovery_oracle_used", False)
+                ),
+                "rollout_mask_policy": rollout_mask_policy,
+                "use_human_bias": bool(args.use_human_bias),
+                "known_wall_penalty": float(args.known_wall_penalty),
+                "revisit_penalty": float(args.revisit_penalty),
+                "loop_penalty": float(args.loop_penalty),
+                "unexplored_bonus": float(args.unexplored_bonus),
+                "goal_progress_bonus": float(args.goal_progress_bonus),
+                "backtrack_penalty": float(args.backtrack_penalty),
+            }
+        ]
+    )
 
     eval_steps.to_csv(output_dir / "action_step_predictions.csv", index=False, encoding="utf-8-sig")
     baselines.to_csv(output_dir / "action_baseline_accuracy.csv", index=False, encoding="utf-8-sig")
     confusion_counts.to_csv(output_dir / "confusion_matrix_counts.csv", encoding="utf-8-sig")
     confusion_normalized.to_csv(output_dir / "confusion_matrix_normalized.csv", encoding="utf-8-sig")
     per_action.to_csv(output_dir / "per_action_accuracy.csv", index=False, encoding="utf-8-sig")
+    variant_summary.to_csv(output_dir / "model_variant_summary.csv", index=False, encoding="utf-8-sig")
     behavior_metrics.to_csv(output_dir / "behavior_recovery_trial_metrics.csv", index=False, encoding="utf-8-sig")
     behavior_summary.to_csv(output_dir / "behavior_recovery_by_task.csv", index=False, encoding="utf-8-sig")
     behavior_diff.to_csv(output_dir / "behavior_recovery_model_minus_actual.csv", index=False, encoding="utf-8-sig")
@@ -634,9 +1118,15 @@ def main() -> None:
         index=False,
         encoding="utf-8-sig",
     )
+    for name, frame in memory_outputs.items():
+        frame.to_csv(output_dir / f"{name}.csv", index=False, encoding="utf-8-sig")
 
     print(f"Subject: {subject_id}")
-    print(f"Split: {args.split}, valid_only={valid_only}, hard_illegal_mask={hard_illegal_mask}")
+    print(
+        f"Split: {args.split}, valid_only={valid_only}, "
+        f"hard_illegal_mask={hard_illegal_mask}, rollout_mask_policy={rollout_mask_policy}, "
+        f"model_variant={model_variant}, use_human_bias={args.use_human_bias}"
+    )
     print(f"Evaluation steps: {len(eval_steps)}")
     print("\nAction baseline accuracy:")
     print(baselines.to_string(index=False))
@@ -644,6 +1134,8 @@ def main() -> None:
     print(per_action.to_string(index=False))
     print("\nBehavior recovery by task:")
     print(behavior_summary.to_string(index=False))
+    print("\nMemory/strategy metrics by task:")
+    print(memory_outputs["memory_metrics_by_task"].to_string(index=False))
     print(f"\nWrote outputs to {output_dir}")
 
 

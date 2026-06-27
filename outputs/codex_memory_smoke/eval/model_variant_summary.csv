@@ -1,0 +1,2 @@
+﻿checkpoint,model_kind,model_variant,cognitive_feature_dim,use_relative_action_head,rollout_mask_policy,use_human_bias,known_wall_penalty,revisit_penalty,loop_penalty,unexplored_bonus,goal_progress_bonus,backtrack_penalty
+outputs\codex_memory_smoke\best_model.pt,minimal,D,50,True,memory_soft,True,3.0,0.15,0.5,0.25,0.15,0.1

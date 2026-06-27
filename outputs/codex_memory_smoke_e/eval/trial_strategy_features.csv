@@ -1,0 +1,7 @@
+﻿source,task,trial,sequence_trial_index,n_steps,collision_rate,repeat_collision_rate,known_wall_collision_rate,unknown_wall_collision_rate,node_revisit_rate,edge_revisit_rate,recent_loop_rate,backtrack_rate,unknown_edge_try_rate,new_node_discovery_rate,frontier_action_rate,forward_rate,left_turn_rate,right_turn_rate,backward_rate,right_hand_rule_match,left_hand_rule_match,wall_following_rate,distance_to_goal_delta_mean,shortest_path_deviation,path_efficiency
+model_rollout,1,4,3,50,0.28,0.0,0.0,0.28,0.24,0.12,0.38,0.1,0.5,0.48,0.5,0.32,0.36,0.2,0.1,0.26,0.48,0.32,-0.04,44,0.12
+actual_subject,1,4,3,14,0.142857,0.0,0.0,0.142857,0.214286,0.0,0.285714,0.071429,0.642857,0.642857,0.642857,0.357143,0.285714,0.214286,0.071429,0.285714,0.428571,0.357143,0.142857,8,0.428571
+model_rollout,1,8,7,5,0.4,0.0,0.0,0.4,0.0,0.0,0.2,0.0,0.6,0.6,0.6,0.2,0.4,0.0,0.0,0.0,0.4,0.2,0.2,2,0.6
+actual_subject,1,8,7,3,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1.0,1.0,0.0,0.666667,0.0,0.0,0.0,0.666667,0.0,0.333333,0,1.0
+model_rollout,1,12,11,5,0.4,0.0,0.0,0.4,0.0,0.0,0.2,0.0,0.6,0.6,0.6,0.2,0.0,0.4,0.0,0.4,0.0,0.2,0.2,2,0.6
+actual_subject,1,12,11,3,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1.0,1.0,0.0,0.0,0.666667,0.0,0.666667,0.0,0.0,0.333333,0,1.0

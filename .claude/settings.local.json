@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(C:/Users/lirui/anaconda3/envs/rnn/python.exe -c ' *)",
+      "Bash(C:/Users/lirui/anaconda3/envs/rnn/python.exe -m MazeTrainer.train_subject_minimal_rollout_rnn --subject-id 13015195273 --model-variant E --epochs 2 --rollout-trials-per-epoch 8 --rollout-eval-max-steps 40 --output-dir outputs/_bug3_test --hidden-dim 512 --selection-metric human_similarity --use-shortest-recovery-loss --rollout-mask-policy memory_soft)",
+      "Bash(rm -rf \"outputs/_bug3_test\")",
+      "Bash(\"C:/Users/lirui/anaconda3/envs/rnn/python.exe\" -m MazeTrainer.train_subject_minimal_rollout_rnn --help)",
+      "Bash(C:/Users/lirui/anaconda3/envs/rnn/python.exe -m MazeTrainer.train_subject_minimal_rollout_rnn --subject-id 13015195273 --model-variant E --epochs 20 --hidden-dim 512 --lr 1e-3 --lambda-relative 0.2 --lambda-next-pos 0.1 --lambda-collision 0.1 --lambda-dist 0.05 --lambda-loop 0.05 --lambda-new-wall 0.05 --rollout-weight 0.08 --rollout-trials-per-epoch 24 --rollout-constraint-max-steps 40 --rollout-eval-max-steps 80 --rollout-mask-policy memory_soft --known-wall-penalty 3.0 --revisit-penalty 0.15 --loop-penalty 0.5 --unexplored-bonus 0.25 --goal-progress-bonus 0.15 --backtrack-penalty 0.1 --shortest-recovery-weight-by-task 1:0.50,2:0.70,3:0.75,4:0.35 --selection-metric human_similarity --output-dir outputs/rnn_subject_memory_E_v2)"
+    ]
+  }
+}

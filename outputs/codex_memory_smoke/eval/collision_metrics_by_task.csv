@@ -1,0 +1,3 @@
+﻿source,task,collision_rate,repeat_collision_rate,known_wall_collision_rate,unknown_wall_collision_rate
+actual_subject,1,0.047619,0.0,0.047619,0.0
+model_rollout,1,0.0,0.0,0.0,0.0

@@ -4,3 +4,4 @@ from .subject_sequence_dataset import (
     SubjectSequenceDataset,
     collate_subject_sequences,
 )
+from .memory_state import MazeMemoryState, feature_names_for_variant

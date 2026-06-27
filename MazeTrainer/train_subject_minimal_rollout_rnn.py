@@ -15,14 +15,23 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from MazeDataset import SubjectSequenceDataset, collate_subject_sequences
+from MazeDataset.memory_state import (
+    ACTION_DELTAS,
+    ACTION_ENCODING,
+    DEFAULT_HEADING,
+    MazeMemoryState,
+    SubjectMazeMemoryStore,
+    WALL_COLUMN_ORDER,
+    feature_names_for_variant,
+    update_heading,
+)
 from MazeDataset.maze_sequence_dataset import IGNORE_INDEX, START_ACTION, parse_json_list
 from MazeDataset.subject_sequence_dataset import interspersed_trial_split
 from MazeRNNAgent import MinimalMazeActionRNN
 from MazeTrainer.train_action_rnn import move_batch_to_device
 
 
-ACTION_DELTAS = {0: -7, 1: -1, 2: 7, 3: 1}
-WALL_COLUMNS = ["walls_l", "walls_u", "walls_r", "walls_d"]
+WALL_COLUMNS = list(WALL_COLUMN_ORDER)
 CORE_DIAGNOSTIC_COLUMNS = [
     "true_path_end_ok",
     "hit_consistent",
@@ -132,6 +141,228 @@ def mask_illegal_logits(logits: torch.Tensor, walls: list[set[int]], state: int)
     return masked
 
 
+def mask_logits_for_policy(
+    logits: torch.Tensor,
+    walls: list[set[int]],
+    state: int,
+    task: int,
+    hit_counts: Counter,
+    mask_policy: str,
+) -> torch.Tensor:
+    if mask_policy == "none":
+        return logits
+    if mask_policy == "hard":
+        return mask_illegal_logits(logits, walls, state)
+
+    effective_policy = mask_policy
+    if mask_policy == "task_specific":
+        effective_policy = "hard" if int(task) in {2, 3} else "repeated_hit"
+    if effective_policy != "repeated_hit":
+        return logits
+
+    masked = logits.clone()
+    for action in range(4):
+        if apply_action(state, action, walls)[1] and hit_counts[(state, action)] > 0:
+            masked[action] = -1e9
+    return masked
+
+
+def human_biased_logits(
+    logits: torch.Tensor,
+    memory: MazeMemoryState,
+    state: int,
+    goal: int,
+    heading: int,
+    args,
+) -> torch.Tensor:
+    if not getattr(args, "use_human_bias", False):
+        return logits
+
+    adjusted = logits.clone()
+    current_goal_distance = abs((int(goal) // 7) - (int(state) // 7)) + abs(
+        (int(goal) % 7) - (int(state) % 7)
+    )
+    for action in range(4):
+        is_known_wall = float(memory.known_wall_mask[int(state), action])
+        is_known_edge = float(memory.known_edge_mask[int(state), action])
+        is_unknown_edge = max(0.0, 1.0 - min(1.0, is_known_wall + is_known_edge))
+        adjusted[action] -= float(args.known_wall_penalty) * is_known_wall
+        adjusted[action] -= float(args.revisit_penalty) * float(
+            memory.visited_edge_count[int(state), action]
+        )
+        adjusted[action] += float(args.unexplored_bonus) * is_unknown_edge
+        if heading >= 0 and action == (int(heading) + 2) % 4:
+            adjusted[action] -= float(args.backtrack_penalty)
+
+        candidate = int(state) + ACTION_DELTAS[action]
+        if 0 <= candidate < 49:
+            next_goal_distance = abs((int(goal) // 7) - (candidate // 7)) + abs(
+                (int(goal) % 7) - (candidate % 7)
+            )
+            if next_goal_distance < current_goal_distance:
+                adjusted[action] += float(args.goal_progress_bonus)
+            if candidate in memory.recent_positions:
+                adjusted[action] -= float(args.loop_penalty)
+    return adjusted
+
+
+def memory_soft_logits(
+    logits: torch.Tensor,
+    memory: MazeMemoryState,
+    state: int,
+    goal: int,
+    heading: int,
+    args,
+) -> torch.Tensor:
+    adjusted = logits.clone()
+    current_goal_distance = abs((int(goal) // 7) - (int(state) // 7)) + abs(
+        (int(goal) % 7) - (int(state) % 7)
+    )
+    for action in range(4):
+        known_wall = float(memory.known_wall_mask[int(state), action])
+        known_edge = float(memory.known_edge_mask[int(state), action])
+        unknown_edge = max(0.0, 1.0 - min(1.0, known_wall + known_edge))
+        adjusted[action] -= float(args.known_wall_penalty) * known_wall
+        adjusted[action] -= float(args.revisit_penalty) * float(
+            memory.visited_edge_count[int(state), action]
+        )
+        adjusted[action] += float(args.unexplored_bonus) * unknown_edge
+        if heading >= 0 and action == (int(heading) + 2) % 4:
+            adjusted[action] -= float(args.backtrack_penalty)
+
+        candidate = int(state) + ACTION_DELTAS[action]
+        if 0 <= candidate < 49:
+            next_goal_distance = abs((int(goal) // 7) - (candidate // 7)) + abs(
+                (int(goal) % 7) - (candidate % 7)
+            )
+            if next_goal_distance < current_goal_distance:
+                adjusted[action] += float(args.goal_progress_bonus)
+            if candidate in memory.recent_positions:
+                adjusted[action] -= float(args.loop_penalty)
+    return adjusted
+
+
+def _copy_memory_store(store: SubjectMazeMemoryStore) -> SubjectMazeMemoryStore:
+    return store.copy()
+
+
+def build_incremental_memory_stores(
+    all_rows: list,
+    base_walls: dict[int, list[set[int]]],
+) -> dict[int, SubjectMazeMemoryStore]:
+    """Return a snapshot of the long-term memory store at the START of each trial.
+
+    Processes all rows in chronological order (they must be pre-sorted) using
+    the true trajectories so that each trial inherits the accumulated wall
+    knowledge from all preceding trials.
+    """
+    snapshots: dict[int, SubjectMazeMemoryStore] = {}
+    store = SubjectMazeMemoryStore()
+
+    for row in all_rows:
+        trial_idx = int(row.sequence_trial_index)
+        snapshots[trial_idx] = _copy_memory_store(store)
+
+        walls = parse_trial_walls(row, base_walls)
+        maze_id = int(getattr(row, "maze", 1))
+        task_id = int(row.task)
+        is_hidden_task = task_id == 4
+        memory = store.start_trial(maze_id=maze_id, task_id=task_id, trial_id=trial_idx)
+
+        true_path = [int(x) for x in parse_json_list(row.true_path)]
+        actions = [int(x) for x in parse_json_list(row.action)]
+        hits_raw = parse_json_list(row.hits)
+
+        n_steps = min(len(actions), len(true_path))
+        for step_idx in range(n_steps):
+            state = true_path[step_idx]
+            action = actions[step_idx]
+            hit = bool(hits_raw[step_idx]) if step_idx < len(hits_raw) else False
+            next_state = true_path[step_idx + 1] if step_idx + 1 < len(true_path) else state
+            memory.update(state, action, next_state, hit, t=step_idx)
+            if not is_hidden_task:
+                memory.observe_local_walls(state, walls)
+
+        store.finish_trial(maze_id, memory)
+
+    return snapshots
+
+
+def parse_task_float_map(value: str, default: float) -> dict[int, float]:
+    mapping = {task: default for task in [1, 2, 3, 4]}
+    if not value:
+        return mapping
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        task, weight = item.split(":", 1)
+        mapping[int(task)] = float(weight)
+    return mapping
+
+
+def build_action_priors(rows: list, alpha: float = 0.25) -> dict:
+    global_counts = np.full(4, alpha, dtype=np.float64)
+    task_counts = {task: np.full(4, alpha, dtype=np.float64) for task in [1, 2, 3, 4]}
+    state_counts: dict[tuple[int, int], np.ndarray] = {}
+
+    for row in rows:
+        task = int(row.task)
+        actions = [int(x) for x in parse_json_list(row.action)]
+        path = [int(x) for x in parse_json_list(row.true_path)]
+        for step_idx, action in enumerate(actions):
+            state = int(path[step_idx]) if step_idx < len(path) else int(row.start)
+            global_counts[action] += 1
+            task_counts.setdefault(task, np.full(4, alpha, dtype=np.float64))[action] += 1
+            state_counts.setdefault((task, state), np.full(4, alpha, dtype=np.float64))[action] += 1
+
+    def normalize(counts):
+        return counts / counts.sum()
+
+    return {
+        "global": normalize(global_counts),
+        "task": {task: normalize(counts) for task, counts in task_counts.items()},
+        "state": {key: normalize(counts) for key, counts in state_counts.items()},
+    }
+
+
+def local_action_prior(action_priors: dict, task: int, state: int) -> np.ndarray:
+    return action_priors["state"].get(
+        (int(task), int(state)),
+        action_priors["task"].get(int(task), action_priors["global"]),
+    )
+
+
+def soft_recovery_target(
+    walls: list[set[int]],
+    state: int,
+    task: int,
+    shortest_action: int,
+    action_priors: dict,
+    shortest_weight_by_task: dict[int, float],
+) -> torch.Tensor:
+    prior = local_action_prior(action_priors, task, state).copy()
+    for action in range(4):
+        if apply_action(state, action, walls)[1]:
+            prior[action] = 0.0
+    if prior.sum() <= 0:
+        legal = legal_actions(walls, state)
+        prior = np.zeros(4, dtype=np.float64)
+        for action in legal:
+            prior[action] = 1.0 / len(legal)
+    else:
+        prior = prior / prior.sum()
+
+    shortest_weight = shortest_weight_by_task.get(int(task), 0.6)
+    target = (1.0 - shortest_weight) * prior
+    if shortest_action != IGNORE_INDEX:
+        target[int(shortest_action)] += shortest_weight
+    return torch.tensor(target, dtype=torch.float32)
+
+
+def soft_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return -(target.to(logits.device) * F.log_softmax(logits, dim=-1)).sum()
+
+
 def stratified_sample_rows_by_task(rows: list, n_rows: int) -> list:
     if n_rows <= 0 or not rows:
         return []
@@ -184,21 +415,74 @@ def prepare_subject_rows(args, split: str) -> pd.DataFrame:
     return df.loc[keep_mask].copy()
 
 
-def forward_loss_and_accuracy(model, batch, behavior_weight, illegal_weight):
-    logits = model(batch)
+def forward_loss_and_accuracy(model, batch, behavior_weight, illegal_weight, args):
+    output = model.forward_with_aux(batch) if hasattr(model, "forward_with_aux") else None
+    logits = output["logits"] if output is not None else model(batch)
     targets = batch["target"]
     behavior_loss = F.cross_entropy(
         logits.reshape(-1, 4),
         targets.reshape(-1),
         ignore_index=IGNORE_INDEX,
     )
+    relative_loss = torch.tensor(0.0, dtype=torch.float32, device=logits.device)
+    if (
+        output is not None
+        and "relative_logits" in output
+        and "relative_target" in batch
+        and args.lambda_relative > 0.0
+    ):
+        relative_loss = F.cross_entropy(
+            output["relative_logits"].reshape(-1, 4),
+            batch["relative_target"].reshape(-1),
+            ignore_index=IGNORE_INDEX,
+        )
 
     probs = torch.softmax(logits, dim=-1)
     illegal_mask = batch["maze_wall"].bool()
     valid = batch["mask"].unsqueeze(-1)
     illegal_mass = probs.masked_fill(~illegal_mask, 0.0).sum(dim=-1)
     illegal_loss = illegal_mass[batch["mask"]].mean()
+    next_pos_loss = torch.tensor(0.0, dtype=torch.float32, device=logits.device)
+    collision_loss = torch.tensor(0.0, dtype=torch.float32, device=logits.device)
+    distance_delta_loss = torch.tensor(0.0, dtype=torch.float32, device=logits.device)
+    loop_loss = torch.tensor(0.0, dtype=torch.float32, device=logits.device)
+    newly_seen_wall_loss = torch.tensor(0.0, dtype=torch.float32, device=logits.device)
+    if output is not None and "next_position_logits" in output:
+        if args.lambda_next_pos > 0.0:
+            next_pos_loss = F.cross_entropy(
+                output["next_position_logits"].reshape(-1, output["next_position_logits"].shape[-1]),
+                batch["next_position_target"].reshape(-1),
+                ignore_index=IGNORE_INDEX,
+            )
+        valid = batch["mask"]
+        if args.lambda_collision > 0.0:
+            collision_loss = F.binary_cross_entropy_with_logits(
+                output["collision_logits"][valid],
+                batch["collision_target"][valid].float(),
+            )
+        if args.lambda_dist > 0.0:
+            distance_delta_loss = F.mse_loss(
+                output["distance_delta"][valid],
+                batch["distance_delta_target"][valid].float(),
+            )
+        if args.lambda_loop > 0.0:
+            loop_loss = F.binary_cross_entropy_with_logits(
+                output["loop_logits"][valid],
+                batch["loop_target"][valid].float(),
+            )
+        if args.lambda_new_wall > 0.0:
+            newly_seen_wall_loss = F.binary_cross_entropy_with_logits(
+                output["newly_seen_wall_logits"][valid],
+                batch["newly_seen_wall_target"][valid].float(),
+            )
+
     loss = behavior_weight * behavior_loss + illegal_weight * illegal_loss
+    loss = loss + float(args.lambda_relative) * relative_loss
+    loss = loss + float(args.lambda_next_pos) * next_pos_loss
+    loss = loss + float(args.lambda_collision) * collision_loss
+    loss = loss + float(args.lambda_dist) * distance_delta_loss
+    loss = loss + float(args.lambda_loop) * loop_loss
+    loss = loss + float(args.lambda_new_wall) * newly_seen_wall_loss
 
     predictions = logits.argmax(dim=-1)
     correct = predictions.eq(targets).logical_and(batch["mask"]).sum().item()
@@ -207,6 +491,12 @@ def forward_loss_and_accuracy(model, batch, behavior_weight, illegal_weight):
     return loss, accuracy, total, {
         "behavior_loss": float(behavior_loss.detach().item()),
         "illegal_loss": float(illegal_loss.detach().item()),
+        "relative_loss": float(relative_loss.detach().item()),
+        "next_pos_loss": float(next_pos_loss.detach().item()),
+        "collision_loss": float(collision_loss.detach().item()),
+        "distance_delta_loss": float(distance_delta_loss.detach().item()),
+        "loop_loss": float(loop_loss.detach().item()),
+        "newly_seen_wall_loss": float(newly_seen_wall_loss.detach().item()),
     }
 
 
@@ -215,10 +505,16 @@ def rollout_constraint_loss(
     rows: list,
     base_walls: dict[int, list[set[int]]],
     recovery_cache: dict[tuple[int, int], int],
+    action_priors: dict,
+    shortest_weight_by_task: dict[int, float],
     device,
     max_steps: int,
     recovery_weight: float,
     no_progress_weight: float,
+    mask_policy: str,
+    model_variant: str,
+    args,
+    memory_snapshots: dict[int, SubjectMazeMemoryStore] | None = None,
 ) -> tuple[torch.Tensor, dict]:
     recovery_losses = []
     no_progress_losses = []
@@ -238,8 +534,20 @@ def rollout_constraint_loss(
         hidden = None
         visited = {state}
         visit_counts = Counter([state])
+        hit_counts = Counter()
+        task = int(row.task)
 
         true_actions = parse_json_list(row.action)
+        trial_idx = int(getattr(row, "sequence_trial_index", -1))
+        maze_id = int(getattr(row, "maze", 1))
+        is_hidden_task = task == 4
+        snapshot_store = memory_snapshots.get(trial_idx) if memory_snapshots else None
+        if snapshot_store is not None:
+            memory = snapshot_store.start_trial(maze_id=maze_id, task_id=task, trial_id=trial_idx)
+        else:
+            memory = MazeMemoryState()
+            memory.reset(task_id=task, trial_id=trial_idx)
+        heading = DEFAULT_HEADING
         true_path = set(parse_json_list(row.true_path))
         short_path = parse_json_list(row.short_path)
         trial_max_steps = min(
@@ -258,17 +566,42 @@ def rollout_constraint_loss(
                     dtype=torch.float32,
                     device=device,
                 ),
+                "cognitive_features": torch.tensor(
+                    memory.get_features(
+                        current_pos=state,
+                        goal_pos=goal,
+                        heading=heading,
+                        walls=None if is_hidden_task else walls,
+                        variant=model_variant,
+                        t=step_idx,
+                    ).reshape(1, 1, -1),
+                    dtype=torch.float32,
+                    device=device,
+                ),
                 "trial_start": torch.tensor(
                     [[1.0 if step_idx == 0 else 0.0]],
                     dtype=torch.float32,
                     device=device,
                 ),
                 "prev_hit": torch.tensor([[prev_hit]], dtype=torch.float32, device=device),
+                "task": torch.tensor([[task]], dtype=torch.long, device=device),
+                "replan": torch.tensor([[int(row.replan)]], dtype=torch.long, device=device),
             }
             x = model.build_input(batch)
             output, hidden = model.rnn(x, hidden)
             logits = model.action_head(output).squeeze(0).squeeze(0)
-            masked_logits = mask_illegal_logits(logits, walls, state)
+            if mask_policy == "memory_soft":
+                masked_logits = memory_soft_logits(logits, memory, state, goal, heading, args)
+            else:
+                biased_logits = human_biased_logits(logits, memory, state, goal, heading, args)
+                masked_logits = mask_logits_for_policy(
+                    biased_logits,
+                    walls,
+                    state,
+                    task,
+                    hit_counts,
+                    mask_policy,
+                )
             probs = torch.softmax(masked_logits, dim=-1)
 
             no_progress_actions = []
@@ -287,20 +620,27 @@ def rollout_constraint_loss(
                     no_progress_weight * probs[no_progress_actions].sum()
                 )
 
-            recovery_target = shortest_recovery_action(
-                walls,
-                state,
-                goal,
-                recovery_cache,
-            )
             is_off_trajectory = state not in true_path or visit_counts[state] > 1
-            if is_off_trajectory and recovery_target != IGNORE_INDEX:
+            recovery_target = IGNORE_INDEX
+            if args.use_shortest_recovery_loss:
+                recovery_target = shortest_recovery_action(
+                    walls,
+                    state,
+                    goal,
+                    recovery_cache,
+                )
+            if args.use_shortest_recovery_loss and is_off_trajectory and recovery_target != IGNORE_INDEX:
+                target = soft_recovery_target(
+                    walls,
+                    state,
+                    task,
+                    recovery_target,
+                    action_priors,
+                    shortest_weight_by_task,
+                ).to(device)
                 recovery_losses.append(
                     recovery_weight
-                    * F.cross_entropy(
-                        masked_logits.unsqueeze(0),
-                        torch.tensor([recovery_target], dtype=torch.long, device=device),
-                    )
+                    * soft_cross_entropy(masked_logits, target)
                 )
                 n_recovery_targets += 1
 
@@ -308,6 +648,8 @@ def rollout_constraint_loss(
             action = int(masked_logits.argmax().detach().item())
             n_prevented_illegal += int(raw_action != action)
             next_state, hit = apply_action(state, action, walls)
+            if hit:
+                hit_counts[(state, action)] += 1
             n_steps += 1
             n_revisit += int((not hit) and next_state in visited)
 
@@ -319,6 +661,10 @@ def rollout_constraint_loss(
                 prev_reward = 1.0
             else:
                 prev_reward = 0.0
+            memory.update(state, action, next_state, hit, t=step_idx)
+            if not is_hidden_task:
+                memory.observe_local_walls(state, walls)
+            heading = update_heading(heading, action, hit)
             state = next_state
             visited.add(state)
             visit_counts[state] += 1
@@ -339,9 +685,20 @@ def rollout_constraint_loss(
     return loss, stats
 
 
-def rollout_metrics(model, rows: pd.DataFrame, base_walls, device, max_steps: int) -> dict:
+def rollout_metrics(
+    model,
+    rows: pd.DataFrame,
+    base_walls,
+    device,
+    max_steps: int,
+    mask_policy: str,
+    model_variant: str,
+    args,
+    memory_snapshots: dict[int, SubjectMazeMemoryStore] | None = None,
+) -> dict:
     model.eval()
     records = []
+    actual_records = []
     with torch.no_grad():
         for row in rows.itertuples(index=False):
             walls = parse_trial_walls(row, base_walls)
@@ -351,10 +708,23 @@ def rollout_metrics(model, rows: pd.DataFrame, base_walls, device, max_steps: in
             prev_hit = 0.0
             prev_reward = 0.0
             hidden = None
+            trial_idx = int(row.sequence_trial_index)
+            maze_id = int(getattr(row, "maze", 1))
+            is_hidden_task = int(row.task) == 4
+            snapshot_store = memory_snapshots.get(trial_idx) if memory_snapshots else None
+            if snapshot_store is not None:
+                memory = snapshot_store.start_trial(maze_id=maze_id, task_id=int(row.task), trial_id=trial_idx)
+            else:
+                memory = MazeMemoryState()
+                memory.reset(task_id=int(row.task), trial_id=trial_idx)
             visited = {state}
+            hit_counts = Counter()
             n_hit = 0
             n_revisit = 0
             true_actions = parse_json_list(row.action)
+            heading = DEFAULT_HEADING
+            true_path = parse_json_list(row.true_path)
+            true_hits = parse_json_list(row.hits)
             short_path = parse_json_list(row.short_path)
             shortest_steps = max(len(short_path) - 1, 1)
             trial_max_steps = max(50, 3 * max(len(true_actions), shortest_steps, 1))
@@ -371,6 +741,18 @@ def rollout_metrics(model, rows: pd.DataFrame, base_walls, device, max_steps: in
                         dtype=torch.float32,
                         device=device,
                     ),
+                    "cognitive_features": torch.tensor(
+                        memory.get_features(
+                            current_pos=state,
+                            goal_pos=goal,
+                            heading=heading,
+                            walls=None if is_hidden_task else walls,
+                            variant=model_variant,
+                            t=step_idx,
+                        ).reshape(1, 1, -1),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
                     "trial_start": torch.tensor(
                         [[1.0 if step_idx == 0 else 0.0]],
                         dtype=torch.float32,
@@ -381,9 +763,22 @@ def rollout_metrics(model, rows: pd.DataFrame, base_walls, device, max_steps: in
                 x = model.build_input(batch)
                 output, hidden = model.rnn(x, hidden)
                 logits = model.action_head(output).squeeze(0).squeeze(0)
-                masked_logits = mask_illegal_logits(logits, walls, state)
+                if mask_policy == "memory_soft":
+                    masked_logits = memory_soft_logits(logits, memory, state, goal, heading, args)
+                else:
+                    biased_logits = human_biased_logits(logits, memory, state, goal, heading, args)
+                    masked_logits = mask_logits_for_policy(
+                        biased_logits,
+                        walls,
+                        state,
+                        int(row.task),
+                        hit_counts,
+                        mask_policy,
+                    )
                 action = int(masked_logits.argmax().item())
                 next_state, hit = apply_action(state, action, walls)
+                if hit:
+                    hit_counts[(state, action)] += 1
                 n_hit += int(hit)
                 n_revisit += int((not hit) and next_state in visited)
                 prev_action = action
@@ -394,6 +789,10 @@ def rollout_metrics(model, rows: pd.DataFrame, base_walls, device, max_steps: in
                     prev_reward = 1.0
                 else:
                     prev_reward = 0.0
+                memory.update(state, action, next_state, hit, t=step_idx)
+                if not is_hidden_task:
+                    memory.observe_local_walls(state, walls)
+                heading = update_heading(heading, action, hit)
                 state = next_state
                 visited.add(state)
                 if state == goal:
@@ -414,8 +813,24 @@ def rollout_metrics(model, rows: pd.DataFrame, base_walls, device, max_steps: in
                     "efficiency": shortest_steps / steps if steps else 0.0,
                 }
             )
+            actual_state_counts = Counter(int(x) for x in true_path)
+            actual_revisits = sum(max(0, count - 1) for count in actual_state_counts.values())
+            actual_steps = max(len(true_actions), 1)
+            actual_records.append(
+                {
+                    "task": int(row.task),
+                    "steps": actual_steps,
+                    "shortest_steps": shortest_steps,
+                    "excess": max(0, actual_steps - shortest_steps),
+                    "hit_rate": sum(bool(x) for x in true_hits) / actual_steps,
+                    "revisit_rate": actual_revisits / len(true_path) if true_path else 0.0,
+                    "reached": 1.0,
+                    "efficiency": shortest_steps / actual_steps,
+                }
+            )
 
     df = pd.DataFrame(records)
+    actual_df = pd.DataFrame(actual_records)
     if df.empty:
         return {
             "rollout_score": -float("inf"),
@@ -448,8 +863,27 @@ def rollout_metrics(model, rows: pd.DataFrame, base_walls, device, max_steps: in
             "mean_efficiency": efficiency,
         }
 
+    def human_similarity_frame(model_frame: pd.DataFrame, actual_frame: pd.DataFrame) -> float:
+        if model_frame.empty or actual_frame.empty:
+            return 0.0
+        actual_steps = max(float(actual_frame["steps"].mean()), 1.0)
+        actual_excess = max(float(actual_frame["excess"].mean()), 1.0)
+        distance = (
+            1.2 * abs(float(model_frame["steps"].mean()) - actual_steps) / actual_steps
+            + 1.0 * abs(float(model_frame["excess"].mean()) - float(actual_frame["excess"].mean())) / actual_excess
+            + 1.0 * abs(float(model_frame["hit_rate"].mean()) - float(actual_frame["hit_rate"].mean()))
+            + 0.8 * abs(float(model_frame["revisit_rate"].mean()) - float(actual_frame["revisit_rate"].mean()))
+            + 0.6 * abs(float(model_frame["efficiency"].mean()) - float(actual_frame["efficiency"].mean()))
+            + 1.5 * max(0.0, float(actual_frame["reached"].mean()) - float(model_frame["reached"].mean()))
+        )
+        return 1.0 / (1.0 + distance)
+
     task_scores = {
         int(task): score_frame(task_df)
+        for task, task_df in df.groupby("task", sort=True)
+    }
+    task_human_similarity = {
+        int(task): human_similarity_frame(task_df, actual_df[actual_df["task"].eq(task)])
         for task, task_df in df.groupby("task", sort=True)
     }
     overall = score_frame(df)
@@ -471,6 +905,7 @@ def rollout_metrics(model, rows: pd.DataFrame, base_walls, device, max_steps: in
     )
     result = {
         "rollout_score": balanced_score,
+        "human_similarity_score": float(np.mean(list(task_human_similarity.values()))),
         "trial_weighted_rollout_score": overall["score"],
         "reached_goal_rate": balanced_reached,
         "mean_excess_steps": balanced_excess,
@@ -480,6 +915,7 @@ def rollout_metrics(model, rows: pd.DataFrame, base_walls, device, max_steps: in
     }
     for task, values in task_scores.items():
         result[f"task{task}_rollout_score"] = values["score"]
+        result[f"task{task}_human_similarity_score"] = task_human_similarity.get(task, 0.0)
         result[f"task{task}_reached_goal_rate"] = values["reached_goal_rate"]
         result[f"task{task}_mean_hit_rate"] = values["mean_hit_rate"]
         result[f"task{task}_mean_excess_steps"] = values["mean_excess_steps"]
@@ -492,6 +928,12 @@ def run_behavior_epoch(model, dataloader, device, args, optimizer=None):
     total_loss = 0.0
     total_behavior_loss = 0.0
     total_illegal_loss = 0.0
+    total_relative_loss = 0.0
+    total_next_pos_loss = 0.0
+    total_collision_loss = 0.0
+    total_distance_delta_loss = 0.0
+    total_loop_loss = 0.0
+    total_newly_seen_wall_loss = 0.0
     total_correct_weighted = 0.0
     total_steps = 0
 
@@ -505,6 +947,7 @@ def run_behavior_epoch(model, dataloader, device, args, optimizer=None):
                 batch,
                 behavior_weight=args.behavior_weight,
                 illegal_weight=args.illegal_weight,
+                args=args,
             )
             if is_train:
                 loss.backward()
@@ -513,6 +956,12 @@ def run_behavior_epoch(model, dataloader, device, args, optimizer=None):
         total_loss += loss.item() * n_steps
         total_behavior_loss += stats["behavior_loss"] * n_steps
         total_illegal_loss += stats["illegal_loss"] * n_steps
+        total_relative_loss += stats["relative_loss"] * n_steps
+        total_next_pos_loss += stats["next_pos_loss"] * n_steps
+        total_collision_loss += stats["collision_loss"] * n_steps
+        total_distance_delta_loss += stats["distance_delta_loss"] * n_steps
+        total_loop_loss += stats["loop_loss"] * n_steps
+        total_newly_seen_wall_loss += stats["newly_seen_wall_loss"] * n_steps
         total_correct_weighted += accuracy * n_steps
         total_steps += n_steps
 
@@ -520,6 +969,12 @@ def run_behavior_epoch(model, dataloader, device, args, optimizer=None):
         "loss": total_loss / total_steps if total_steps else 0.0,
         "behavior_loss": total_behavior_loss / total_steps if total_steps else 0.0,
         "illegal_loss": total_illegal_loss / total_steps if total_steps else 0.0,
+        "relative_loss": total_relative_loss / total_steps if total_steps else 0.0,
+        "next_pos_loss": total_next_pos_loss / total_steps if total_steps else 0.0,
+        "collision_loss": total_collision_loss / total_steps if total_steps else 0.0,
+        "distance_delta_loss": total_distance_delta_loss / total_steps if total_steps else 0.0,
+        "loop_loss": total_loop_loss / total_steps if total_steps else 0.0,
+        "newly_seen_wall_loss": total_newly_seen_wall_loss / total_steps if total_steps else 0.0,
         "accuracy": total_correct_weighted / total_steps if total_steps else 0.0,
         "steps": total_steps,
     }
@@ -533,6 +988,7 @@ def run_rollout_constraint_step(
     device,
     args,
     optimizer,
+    memory_snapshots: dict[int, SubjectMazeMemoryStore] | None = None,
 ):
     if args.rollout_weight <= 0.0 or args.rollout_trials_per_epoch <= 0:
         return {
@@ -548,10 +1004,16 @@ def run_rollout_constraint_step(
         sampled_rows,
         base_walls,
         recovery_cache,
+        args.action_priors,
+        args.shortest_weight_by_task,
         device,
         max_steps=args.rollout_constraint_max_steps,
         recovery_weight=args.off_trajectory_recovery_weight,
         no_progress_weight=args.rollout_no_progress_weight,
+        mask_policy=args.rollout_mask_policy,
+        model_variant=args.model_variant,
+        args=args,
+        memory_snapshots=memory_snapshots,
     )
     scaled_loss = args.rollout_weight * loss
     scaled_loss.backward()
@@ -620,17 +1082,47 @@ def build_arg_parser():
     parser.add_argument("--val-offset", type=int, default=3)
     parser.add_argument("--max-trials", type=int, default=None)
     parser.add_argument("--behavior-weight", type=float, default=1.0)
-    parser.add_argument("--illegal-weight", type=float, default=0.03)
+    parser.add_argument("--illegal-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--model-variant",
+        default="A",
+        choices=["A", "B", "C", "D", "E"],
+        help="A=baseline, B=local visual/topology, C=explicit memory, D=heading/relative action.",
+    )
+    parser.add_argument("--lambda-relative", type=float, default=0.0)
+    parser.add_argument("--lambda-next-pos", type=float, default=0.0)
+    parser.add_argument("--lambda-collision", type=float, default=0.0)
+    parser.add_argument("--lambda-dist", type=float, default=0.0)
+    parser.add_argument("--lambda-loop", type=float, default=0.0)
+    parser.add_argument("--lambda-new-wall", type=float, default=0.0)
     parser.add_argument("--rollout-weight", type=float, default=0.08)
     parser.add_argument("--rollout-trials-per-epoch", type=int, default=24)
     parser.add_argument("--rollout-constraint-max-steps", type=int, default=40)
     parser.add_argument("--rollout-eval-max-steps", type=int, default=80)
     parser.add_argument("--off-trajectory-recovery-weight", type=float, default=1.0)
-    parser.add_argument("--rollout-no-progress-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--shortest-recovery-weight-by-task",
+        default="1:0.50,2:0.70,3:0.75,4:0.35",
+        help="Comma-separated task:weight map for soft recovery targets.",
+    )
+    parser.add_argument(
+        "--rollout-mask-policy",
+        default="memory_soft",
+        choices=["none", "hard", "repeated_hit", "task_specific", "memory_soft"],
+    )
+    parser.add_argument("--use-shortest-recovery-loss", action="store_true")
+    parser.add_argument("--use-human-bias", action="store_true")
+    parser.add_argument("--known-wall-penalty", type=float, default=3.0)
+    parser.add_argument("--revisit-penalty", type=float, default=0.15)
+    parser.add_argument("--loop-penalty", type=float, default=0.5)
+    parser.add_argument("--unexplored-bonus", type=float, default=0.25)
+    parser.add_argument("--goal-progress-bonus", type=float, default=0.15)
+    parser.add_argument("--backtrack-penalty", type=float, default=0.1)
+    parser.add_argument("--rollout-no-progress-weight", type=float, default=0.0)
     parser.add_argument(
         "--selection-metric",
-        default="rollout_score",
-        choices=["rollout_score", "val_accuracy"],
+        default="human_similarity",
+        choices=["human_similarity", "rollout_score", "val_accuracy"],
     )
     return parser
 
@@ -648,6 +1140,14 @@ def main() -> None:
     if log_path.exists():
         log_path.unlink()
 
+    # Build memory snapshots first — datasets and rollout functions all depend on them.
+    base_walls = load_base_walls(args.maze_wall)
+    all_rows = list(prepare_subject_rows(args, "all").itertuples(index=False))
+    memory_snapshots = build_incremental_memory_stores(all_rows, base_walls)
+    print(f"Built memory snapshots for {len(memory_snapshots)} trials.")
+    train_rows = list(prepare_subject_rows(args, "train").itertuples(index=False))
+    val_rows = prepare_subject_rows(args, "val")
+
     train_dataset = SubjectSequenceDataset(
         csv_path=args.input,
         maze_wall_path=args.maze_wall,
@@ -658,6 +1158,8 @@ def main() -> None:
         valid_only=args.valid_only,
         diagnostics_path=args.diagnostics,
         max_trials=args.max_trials,
+        model_variant=args.model_variant,
+        memory_snapshots=memory_snapshots,
     )
     val_dataset = SubjectSequenceDataset(
         csv_path=args.input,
@@ -669,11 +1171,15 @@ def main() -> None:
         valid_only=args.valid_only,
         diagnostics_path=args.diagnostics,
         max_trials=args.max_trials,
+        model_variant=args.model_variant,
+        memory_snapshots=memory_snapshots,
     )
-    train_rows = list(prepare_subject_rows(args, "train").itertuples(index=False))
-    val_rows = prepare_subject_rows(args, "val")
-    base_walls = load_base_walls(args.maze_wall)
     recovery_cache: dict[tuple[int, int], int] = {}
+    args.action_priors = build_action_priors(train_rows)
+    args.shortest_weight_by_task = parse_task_float_map(
+        args.shortest_recovery_weight_by_task,
+        default=0.6,
+    )
 
     grouping_rows = [
         summarize_dataset(train_dataset, "train"),
@@ -694,7 +1200,25 @@ def main() -> None:
         collate_fn=collate_subject_sequences,
     )
 
-    model = MinimalMazeActionRNN(hidden_dim=args.hidden_dim).to(device)
+    cognitive_feature_names = feature_names_for_variant(args.model_variant)
+    include_maze_wall = False
+    use_auxiliary_heads = args.model_variant == "E" and any(
+        value > 0.0
+        for value in [
+            args.lambda_next_pos,
+            args.lambda_collision,
+            args.lambda_dist,
+            args.lambda_loop,
+            args.lambda_new_wall,
+        ]
+    )
+    model = MinimalMazeActionRNN(
+        hidden_dim=args.hidden_dim,
+        cognitive_feature_dim=len(cognitive_feature_names),
+        include_maze_wall=include_maze_wall,
+        use_relative_action_head=args.model_variant in {"D", "E"} and args.lambda_relative > 0,
+        use_auxiliary_heads=use_auxiliary_heads,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     best_value = -float("inf")
     best_path = output_dir / "best_model.pt"
@@ -724,6 +1248,7 @@ def main() -> None:
             device,
             args,
             optimizer,
+            memory_snapshots=memory_snapshots,
         )
         val_stats = run_behavior_epoch(model, val_loader, device, args, optimizer=None)
         rollout_stats = rollout_metrics(
@@ -732,12 +1257,20 @@ def main() -> None:
             base_walls,
             device,
             max_steps=args.rollout_eval_max_steps,
+            mask_policy=args.rollout_mask_policy,
+            model_variant=args.model_variant,
+            args=args,
+            memory_snapshots=memory_snapshots,
         )
 
         selection_value = (
-            rollout_stats["rollout_score"]
-            if args.selection_metric == "rollout_score"
-            else val_stats["accuracy"]
+            rollout_stats["human_similarity_score"]
+            if args.selection_metric == "human_similarity"
+            else (
+                rollout_stats["rollout_score"]
+                if args.selection_metric == "rollout_score"
+                else val_stats["accuracy"]
+            )
         )
 
         row = {
@@ -745,6 +1278,12 @@ def main() -> None:
             "train_loss": round(train_stats["loss"], 6),
             "train_behavior_loss": round(train_stats["behavior_loss"], 6),
             "train_illegal_loss": round(train_stats["illegal_loss"], 6),
+            "train_relative_loss": round(train_stats["relative_loss"], 6),
+            "train_next_pos_loss": round(train_stats["next_pos_loss"], 6),
+            "train_collision_loss": round(train_stats["collision_loss"], 6),
+            "train_distance_delta_loss": round(train_stats["distance_delta_loss"], 6),
+            "train_loop_loss": round(train_stats["loop_loss"], 6),
+            "train_newly_seen_wall_loss": round(train_stats["newly_seen_wall_loss"], 6),
             "train_accuracy": round(train_stats["accuracy"], 6),
             "train_steps": train_stats["steps"],
             **{
@@ -754,6 +1293,12 @@ def main() -> None:
             "val_loss": round(val_stats["loss"], 6),
             "val_behavior_loss": round(val_stats["behavior_loss"], 6),
             "val_illegal_loss": round(val_stats["illegal_loss"], 6),
+            "val_relative_loss": round(val_stats["relative_loss"], 6),
+            "val_next_pos_loss": round(val_stats["next_pos_loss"], 6),
+            "val_collision_loss": round(val_stats["collision_loss"], 6),
+            "val_distance_delta_loss": round(val_stats["distance_delta_loss"], 6),
+            "val_loop_loss": round(val_stats["loop_loss"], 6),
+            "val_newly_seen_wall_loss": round(val_stats["newly_seen_wall_loss"], 6),
             "val_accuracy": round(val_stats["accuracy"], 6),
             "val_steps": val_stats["steps"],
             **{
@@ -773,12 +1318,36 @@ def main() -> None:
                     "args": vars(args)
                     | {
                         "model_kind": "minimal",
-                        "hard_illegal_action_mask": True,
-                        "training_recipe": "minimal_rollout_constrained",
+                        "rollout_mask_policy": args.rollout_mask_policy,
+                        "training_recipe": "minimal_human_mask_soft_recovery",
+                        "model_variant": args.model_variant,
+                        "cognitive_feature_dim": len(cognitive_feature_names),
+                        "cognitive_feature_names": cognitive_feature_names,
+                        "include_maze_wall": include_maze_wall,
+                        "use_relative_action_head": model.use_relative_action_head,
+                        "use_auxiliary_heads": model.use_auxiliary_heads,
+                        "action_encoding": ACTION_ENCODING,
+                        "action_deltas": ACTION_DELTAS,
+                        "wall_column_order": WALL_COLUMNS,
+                        "heading_first_step_ignored": True,
+                        "hard_mask_used": args.rollout_mask_policy in {"hard", "task_specific"},
+                        "shortest_recovery_oracle_used": bool(args.use_shortest_recovery_loss),
                     },
                     "model_kind": "minimal",
-                    "training_recipe": "minimal_rollout_constrained",
-                    "hard_illegal_action_mask": True,
+                    "training_recipe": "minimal_human_mask_soft_recovery",
+                    "rollout_mask_policy": args.rollout_mask_policy,
+                    "model_variant": args.model_variant,
+                    "cognitive_feature_dim": len(cognitive_feature_names),
+                    "cognitive_feature_names": cognitive_feature_names,
+                    "include_maze_wall": include_maze_wall,
+                    "use_relative_action_head": model.use_relative_action_head,
+                    "use_auxiliary_heads": model.use_auxiliary_heads,
+                    "action_encoding": ACTION_ENCODING,
+                    "action_deltas": ACTION_DELTAS,
+                    "wall_column_order": WALL_COLUMNS,
+                    "heading_first_step_ignored": True,
+                    "hard_mask_used": args.rollout_mask_policy in {"hard", "task_specific"},
+                    "shortest_recovery_oracle_used": bool(args.use_shortest_recovery_loss),
                     "selection_metric": args.selection_metric,
                     "best_selection_value": best_value,
                     "best_rollout_metrics": rollout_stats,
@@ -787,10 +1356,12 @@ def main() -> None:
                         "prev_action",
                         "goal",
                         "prev_reward",
-                        "maze_wall",
                         "trial_start_flag",
                         "wall_hit",
-                    ],
+                    ]
+                    + (["maze_wall"] if include_maze_wall else [])
+                    + cognitive_feature_names
+                    + (["relative_action_head"] if model.use_relative_action_head else []),
                     "grouping": grouping_rows,
                 },
                 best_path,
@@ -801,6 +1372,7 @@ def main() -> None:
             f"train acc {train_stats['accuracy']:.4f} | "
             f"val acc {val_stats['accuracy']:.4f} | "
             f"rollout score {rollout_stats['rollout_score']:.4f}, "
+            f"human {rollout_stats['human_similarity_score']:.4f}, "
             f"reach {rollout_stats['reached_goal_rate']:.3f}, "
             f"hit {rollout_stats['mean_hit_rate']:.3f}, "
             f"revisit {rollout_stats['mean_revisit_rate']:.3f}"

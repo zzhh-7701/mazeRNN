@@ -1,0 +1,3 @@
+﻿source,task,unknown_edge_try_rate,new_node_discovery_rate,frontier_action_rate,distance_to_goal_delta_mean,shortest_path_deviation,path_efficiency
+actual_subject,1,0.880952,0.880952,0.880952,0.269841,2.666667,0.809524
+model_rollout,1,0.566667,0.56,0.566667,0.12,16.0,0.44
